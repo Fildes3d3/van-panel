@@ -1,0 +1,23 @@
+# build output
+.pio/
+cmake-build-*/
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# local logs and captures (serial dumps, measurement notes)
+*.log
+logs/
+captures/
+
+# anything holding credentials or per-device data - keep these out of a public repo
+secrets.h
+secrets.*
+*.secret
+.env
+wifi_*.txt
+
+# engineering log: kept locally, not published
+CLAUDE.md
