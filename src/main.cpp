@@ -157,6 +157,8 @@ static const char    *HOLD_OPTS      = "Until release\n5 s\n15 s\n60 s";
 static constexpr int  HOLD_DEFAULT   = 1;                      // 5 s
 static constexpr int      BACKLIGHT_EXIO   = 2;   // CH422G EXIO2 = backlight enable on this board (per its profile)
 static constexpr uint32_t BL_TEST_MS       = 5000;
+static constexpr int      BL_WRITE_TRIES    = 3;      // the expander write is on the shared I2C bus: verify it
+static constexpr uint32_t BL_REASSERT_MS    = 5000;   // while blanked, re-assert "off" in case a glitch flips it
 static constexpr uint32_t ERROR_FRESH_MS = 5UL * 60UL * 1000UL;  // status dot shows recent errors, not a latch
 
 // PROVISIONAL volts calibration, 499 ohm burden: V = VOLT_OFFSET + VOLT_PER_MV * mV
@@ -226,7 +228,35 @@ static uint32_t g_bl_change_ms  = 0;
 static time_t   g_bl_change_time = 0;
 static bool     g_bl_driver_ok  = true;
 static bool     g_bl_exio_ok    = true;
-static uint32_t g_wakes         = 0;              // backlight test: light stays off until this millis()
+static int      g_bl_readback   = -1;             // pin state read back after writing (-1 = read not available)
+static uint32_t g_bl_fixes      = 0;              // times the re-assert found the pin wrong and corrected it
+static uint32_t g_wakes         = 0;
+static uint32_t g_reassert_ms   = 0;
+
+// Last few screen events, so the Diag page still shows what happened before the touch that woke the screen
+static constexpr int SCREEN_LOG_ROWS = 5;
+struct ScreenEvent {
+    time_t   when;
+    uint32_t ms;
+    char     text[56];
+};
+static ScreenEvent g_scr_log[SCREEN_LOG_ROWS];
+static int         g_scr_log_count = 0;
+
+static void screen_log(const char *fmt, ...)
+{
+    char buf[56];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    for (int i = SCREEN_LOG_ROWS - 1; i > 0; i--) g_scr_log[i] = g_scr_log[i - 1];
+    g_scr_log[0].when = time(nullptr);
+    g_scr_log[0].ms   = millis();
+    strlcpy(g_scr_log[0].text, buf, sizeof(g_scr_log[0].text));
+    if (g_scr_log_count < SCREEN_LOG_ROWS) g_scr_log_count++;
+    Serial.printf("[screen] %s\n", buf);
+}              // backlight test: light stays off until this millis()
 static int       g_timeout_idx = TIMEOUT_DEFAULT;
 static lv_obj_t *dd_hold       = nullptr;
 static int       g_hold_idx    = HOLD_DEFAULT;
@@ -277,6 +307,7 @@ static lv_obj_t *lbl_hist    = nullptr;
 static lv_obj_t *lbl_diag    = nullptr;
 static lv_obj_t *lbl_netst   = nullptr;
 static lv_obj_t *lbl_screen  = nullptr;
+static lv_obj_t *lbl_scrlog  = nullptr;
 
 // keyboard modal
 static lv_obj_t *kb_modal    = nullptr;
@@ -670,29 +701,58 @@ static void set_state_text(const char *text)
 
 // ---------- display timeout --------------------------------------------------
 
-// Switches the backlight and reports what happened: first through the library driver, then by writing the
-// expander pin directly, so a failure can be told apart from a pin that does not control the light.
+// Switches the backlight and checks that it took. The expander sits on the same I2C bus as everything else, and
+// the van (unlike the bench) does produce occasional bus errors - a write that is reported as sent but never
+// reaches the chip would leave the backlight on while the screen is already blank, which is what was seen.
 static void backlight_set(bool on)
 {
     auto bl = g_board ? g_board->getBacklight() : nullptr;
-    g_bl_driver_ok = false;
-    if (bl) {
-        g_bl_driver_ok = on ? bl->on() : bl->off();
-        Serial.printf("[screen] backlight %s via driver: %s\n", on ? "on" : "off", g_bl_driver_ok ? "ok" : "FAILED");
-    } else {
-        Serial.println("[screen] no backlight driver available");
-    }
     auto exp_dev = (g_board && g_board->getIO_Expander()) ? g_board->getIO_Expander()->getBase() : nullptr;
+
+    g_bl_driver_ok = false;
+    if (bl) g_bl_driver_ok = on ? bl->on() : bl->off();
+
     g_bl_exio_ok = false;
-    if (exp_dev) {
+    g_bl_readback = -1;
+    for (int attempt = 1; attempt <= BL_WRITE_TRIES && exp_dev; attempt++) {
         g_bl_exio_ok = exp_dev->digitalWrite(BACKLIGHT_EXIO, on ? 1 : 0);
-        Serial.printf("[screen] EXIO%d <- %d: %s\n", BACKLIGHT_EXIO, on ? 1 : 0, g_bl_exio_ok ? "ok" : "FAILED");
-    } else {
-        Serial.println("[screen] no IO expander available");
+        g_bl_readback = exp_dev->digitalRead(BACKLIGHT_EXIO);
+        if (!g_bl_exio_ok) {
+            Serial.printf("[screen] EXIO%d write failed (attempt %d)\n", BACKLIGHT_EXIO, attempt);
+            continue;
+        }
+        if (g_bl_readback < 0) break;                 // no usable read-back: trust the write
+        if ((g_bl_readback != 0) == on) break;        // read-back agrees with what was asked for
+        Serial.printf("[screen] EXIO%d read back %d, wanted %d (attempt %d)\n", BACKLIGHT_EXIO, g_bl_readback,
+                      on ? 1 : 0, attempt);
     }
+
     g_bl_on = on;
     g_bl_change_ms = millis();
     g_bl_change_time = time(nullptr);
+    g_reassert_ms = millis();
+    screen_log("backlight %s (driver %s, pin %s, read %s)", on ? "on" : "off", g_bl_driver_ok ? "ok" : "FAIL",
+               g_bl_exio_ok ? "ok" : "FAIL",
+               g_bl_readback < 0 ? "n/a" : (((g_bl_readback != 0) == on) ? "ok" : "MISMATCH"));
+}
+
+// While the screen is blanked, keep the pin at "off". If a disturbed I2C transfer ever flips it back, this puts
+// it right within a few seconds instead of leaving the panel lit.
+static void backlight_reassert()
+{
+    if (!g_screen_off || millis() - g_reassert_ms < BL_REASSERT_MS) return;
+    g_reassert_ms = millis();
+    auto exp_dev = (g_board && g_board->getIO_Expander()) ? g_board->getIO_Expander()->getBase() : nullptr;
+    if (!exp_dev) return;
+    int rb = exp_dev->digitalRead(BACKLIGHT_EXIO);
+    if (rb > 0) {                                     // pin is high again although the screen is blanked
+        g_bl_fixes++;
+        exp_dev->digitalWrite(BACKLIGHT_EXIO, 0);
+        if (g_board->getBacklight()) g_board->getBacklight()->off();
+        screen_log("backlight was ON while blanked - corrected (%lu)", (unsigned long)g_bl_fixes);
+    } else if (rb < 0) {
+        exp_dev->digitalWrite(BACKLIGHT_EXIO, 0);     // no read-back available: just write it again
+    }
 }
 
 static void screen_off()
@@ -705,7 +765,7 @@ static void screen_off()
     delay(60);                                    // let the black frame reach the panel before the light goes out
     backlight_set(false);
     g_screen_off = true;
-    Serial.println("[screen] off (timeout)");
+    screen_log("screen blanked (timeout)");
 }
 
 static void screen_on(const char *why)
@@ -718,7 +778,7 @@ static void screen_on(const char *why)
     backlight_set(true);
     g_screen_off = false;
     g_wakes++;
-    Serial.printf("[screen] on (%s)\n", why);
+    screen_log("woke: %s", why);
 }
 
 static void check_screen_timeout()
@@ -898,7 +958,7 @@ static void run_diagnostics()
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV);
-    char sline[200];
+    char sline[260];
     if (g_bl_change_ms) {
         uint32_t ago = (millis() - g_bl_change_ms) / 1000;
         char when[24] = "";
@@ -916,8 +976,26 @@ static void run_diagnostics()
         snprintf(sline, sizeof(sline), "Screen: showing, backlight ON (never switched yet)   wakes: %lu",
                  (unsigned long)g_wakes);
     }
+    size_t sl = strlen(sline);
+    if (g_bl_fixes) sl += snprintf(sline + sl, sizeof(sline) - sl, "   corrections: %lu", (unsigned long)g_bl_fixes);
+    static char slog[SCREEN_LOG_ROWS * 80 + 8];
+    size_t ll = 0;
+    slog[0] = '\0';
+    for (int i = 0; i < g_scr_log_count && ll < sizeof(slog) - 80; i++) {
+        const ScreenEvent &e = g_scr_log[i];
+        char when[16];
+        if (e.when > TIME_VALID_AFTER) {
+            struct tm t;
+            localtime_r(&e.when, &t);
+            snprintf(when, sizeof(when), "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+        } else {
+            snprintf(when, sizeof(when), "+%lus", (unsigned long)(e.ms / 1000));
+        }
+        ll += snprintf(slog + ll, sizeof(slog) - ll, "%s  %s\n", when, e.text);
+    }
     lvgl_port_lock(-1);
     lv_label_set_text(lbl_screen, sline);
+    lv_label_set_text(lbl_scrlog, slog[0] ? slog : "(no screen events yet)");
     lv_label_set_text(lbl_diag, line);
     bool recent_error = g_last_error_ms && (millis() - g_last_error_ms) < ERROR_FRESH_MS;
     lv_obj_set_style_text_color(lbl_diag, recent_error ? COL_WARN : COL_MUTED, 0);
@@ -1563,11 +1641,15 @@ static void build_diag_tab(lv_obj_t *t)
     lv_label_set_text(lbl_screen, "Screen: --");
     lv_obj_set_pos(lbl_screen, 0, 236);
 
+    lbl_scrlog = make_label(t, &lv_font_montserrat_14, COL_DIM);
+    lv_label_set_text(lbl_scrlog, "(no screen events yet)");
+    lv_obj_set_pos(lbl_scrlog, 0, 258);
+
     lbl_netst = make_label(t, &lv_font_montserrat_14, COL_MUTED);
     lv_label_set_long_mode(lbl_netst, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(lbl_netst, 740);
     lv_label_set_text(lbl_netst, "Network: --");
-    lv_obj_set_pos(lbl_netst, 0, 286);
+    lv_obj_set_pos(lbl_netst, 0, 352);
 }
 
 static void build_settings_screen()
@@ -1850,6 +1932,7 @@ void loop()
     if (now - last_screen_ms >= SCREEN_CHECK_MS) {
         last_screen_ms = now;
         check_screen_timeout();
+        backlight_reassert();
     }
     if (now - last_net_ms >= NET_UI_PERIOD_MS) {
         last_net_ms = now;
