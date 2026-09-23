@@ -155,6 +155,8 @@ static constexpr uint32_t WIN_END_MS      = 500;
 static const uint16_t HOLD_SECONDS[] = {0, 5, 15, 60};        // 0 = clear as soon as the selector is released
 static const char    *HOLD_OPTS      = "Until release\n5 s\n15 s\n60 s";
 static constexpr int  HOLD_DEFAULT   = 1;                      // 5 s
+static constexpr int      BACKLIGHT_EXIO   = 2;   // CH422G EXIO2 = backlight enable on this board (per its profile)
+static constexpr uint32_t BL_TEST_MS       = 5000;
 static constexpr uint32_t ERROR_FRESH_MS = 5UL * 60UL * 1000UL;  // status dot shows recent errors, not a latch
 
 // PROVISIONAL volts calibration, 499 ohm burden: V = VOLT_OFFSET + VOLT_PER_MV * mV
@@ -216,6 +218,15 @@ static lv_obj_t *scr_blank     = nullptr;
 static lv_obj_t *scr_prev      = nullptr;
 static lv_obj_t *dd_timeout    = nullptr;
 static bool      g_screen_off  = false;
+static uint32_t  g_bl_test_end = 0;
+// Screen/backlight bookkeeping for the diagnostics page: the backlight once stayed on in the van although the
+// screen had blanked, and neither path could be made to fail on the bench. These fields say what actually ran.
+static bool     g_bl_on         = true;
+static uint32_t g_bl_change_ms  = 0;
+static time_t   g_bl_change_time = 0;
+static bool     g_bl_driver_ok  = true;
+static bool     g_bl_exio_ok    = true;
+static uint32_t g_wakes         = 0;              // backlight test: light stays off until this millis()
 static int       g_timeout_idx = TIMEOUT_DEFAULT;
 static lv_obj_t *dd_hold       = nullptr;
 static int       g_hold_idx    = HOLD_DEFAULT;
@@ -265,6 +276,7 @@ static lv_obj_t *lbl_scan    = nullptr;
 static lv_obj_t *lbl_hist    = nullptr;
 static lv_obj_t *lbl_diag    = nullptr;
 static lv_obj_t *lbl_netst   = nullptr;
+static lv_obj_t *lbl_screen  = nullptr;
 
 // keyboard modal
 static lv_obj_t *kb_modal    = nullptr;
@@ -658,6 +670,31 @@ static void set_state_text(const char *text)
 
 // ---------- display timeout --------------------------------------------------
 
+// Switches the backlight and reports what happened: first through the library driver, then by writing the
+// expander pin directly, so a failure can be told apart from a pin that does not control the light.
+static void backlight_set(bool on)
+{
+    auto bl = g_board ? g_board->getBacklight() : nullptr;
+    g_bl_driver_ok = false;
+    if (bl) {
+        g_bl_driver_ok = on ? bl->on() : bl->off();
+        Serial.printf("[screen] backlight %s via driver: %s\n", on ? "on" : "off", g_bl_driver_ok ? "ok" : "FAILED");
+    } else {
+        Serial.println("[screen] no backlight driver available");
+    }
+    auto exp_dev = (g_board && g_board->getIO_Expander()) ? g_board->getIO_Expander()->getBase() : nullptr;
+    g_bl_exio_ok = false;
+    if (exp_dev) {
+        g_bl_exio_ok = exp_dev->digitalWrite(BACKLIGHT_EXIO, on ? 1 : 0);
+        Serial.printf("[screen] EXIO%d <- %d: %s\n", BACKLIGHT_EXIO, on ? 1 : 0, g_bl_exio_ok ? "ok" : "FAILED");
+    } else {
+        Serial.println("[screen] no IO expander available");
+    }
+    g_bl_on = on;
+    g_bl_change_ms = millis();
+    g_bl_change_time = time(nullptr);
+}
+
 static void screen_off()
 {
     if (g_screen_off) return;
@@ -666,7 +703,7 @@ static void screen_off()
     lv_scr_load(scr_blank);
     lvgl_port_unlock();
     delay(60);                                    // let the black frame reach the panel before the light goes out
-    if (g_board && g_board->getBacklight()) g_board->getBacklight()->off();
+    backlight_set(false);
     g_screen_off = true;
     Serial.println("[screen] off (timeout)");
 }
@@ -678,8 +715,9 @@ static void screen_on(const char *why)
     lv_scr_load(scr_prev ? scr_prev : scr_main);
     lv_disp_trig_activity(nullptr);
     lvgl_port_unlock();
-    if (g_board && g_board->getBacklight()) g_board->getBacklight()->on();
+    backlight_set(true);
     g_screen_off = false;
+    g_wakes++;
     Serial.printf("[screen] on (%s)\n", why);
 }
 
@@ -704,6 +742,14 @@ static void hold_dd_cb(lv_event_t *e)
     p.putUChar("hold", (uint8_t)g_hold_idx);
     p.end();
     Serial.printf("[display] keep reading: %u s (0 = until release)\n", HOLD_SECONDS[g_hold_idx]);
+}
+
+static void bl_test_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    g_bl_test_end = millis() + BL_TEST_MS;
+    if (g_bl_test_end == 0) g_bl_test_end = 1;
+    Serial.println("[screen] backlight test: off for 5 s");
 }
 
 static void timeout_dd_cb(lv_event_t *e)
@@ -852,7 +898,26 @@ static void run_diagnostics()
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV);
+    char sline[200];
+    if (g_bl_change_ms) {
+        uint32_t ago = (millis() - g_bl_change_ms) / 1000;
+        char when[24] = "";
+        if (g_bl_change_time > TIME_VALID_AFTER) {
+            struct tm b;
+            localtime_r(&g_bl_change_time, &b);
+            snprintf(when, sizeof(when), " at %02d:%02d,", b.tm_hour, b.tm_min);
+        }
+        snprintf(sline, sizeof(sline),
+                 "Screen: %s, backlight %s (last switched%s %lu s ago; driver %s, EXIO%d %s)   wakes: %lu",
+                 g_screen_off ? "blanked" : "showing", g_bl_on ? "ON" : "off", when, (unsigned long)ago,
+                 g_bl_driver_ok ? "ok" : "FAILED", BACKLIGHT_EXIO, g_bl_exio_ok ? "ok" : "FAILED",
+                 (unsigned long)g_wakes);
+    } else {
+        snprintf(sline, sizeof(sline), "Screen: showing, backlight ON (never switched yet)   wakes: %lu",
+                 (unsigned long)g_wakes);
+    }
     lvgl_port_lock(-1);
+    lv_label_set_text(lbl_screen, sline);
     lv_label_set_text(lbl_diag, line);
     bool recent_error = g_last_error_ms && (millis() - g_last_error_ms) < ERROR_FRESH_MS;
     lv_obj_set_style_text_color(lbl_diag, recent_error ? COL_WARN : COL_MUTED, 0);
@@ -1466,6 +1531,9 @@ static void build_display_tab(lv_obj_t *t)
                          "switches off (saves power and prevents image retention). Touch anywhere or press a "
                          "selector to wake - the waking touch does not press any button.");
     lv_obj_set_pos(n, 0, 134);
+    lv_obj_t *bt = make_button(t, "Backlight test (5 s off)", 320, 46, bl_test_cb, nullptr);
+    lv_obj_set_pos(bt, 420, 128);
+
     lv_obj_t *n2 = make_label(t, &lv_font_montserrat_16, COL_DIM);
     lv_label_set_long_mode(n2, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(n2, 740);
@@ -1489,11 +1557,17 @@ static void build_diag_tab(lv_obj_t *t)
     lbl_diag = make_label(t, &lv_font_montserrat_14, COL_MUTED);
     lv_label_set_text(lbl_diag, "Idle: --");
     lv_obj_set_pos(lbl_diag, 0, 190);
+    lbl_screen = make_label(t, &lv_font_montserrat_14, COL_MUTED);
+    lv_label_set_long_mode(lbl_screen, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_screen, 740);
+    lv_label_set_text(lbl_screen, "Screen: --");
+    lv_obj_set_pos(lbl_screen, 0, 236);
+
     lbl_netst = make_label(t, &lv_font_montserrat_14, COL_MUTED);
     lv_label_set_long_mode(lbl_netst, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(lbl_netst, 740);
     lv_label_set_text(lbl_netst, "Network: --");
-    lv_obj_set_pos(lbl_netst, 0, 262);
+    lv_obj_set_pos(lbl_netst, 0, 286);
 }
 
 static void build_settings_screen()
@@ -1762,6 +1836,17 @@ void loop()
         }
     }
 
+    if (g_bl_test_end) {                          // manual backlight test from Settings > Display
+        static bool test_off = false;
+        if (!test_off) {
+            test_off = true;
+            backlight_set(false);
+        } else if ((int32_t)(now - g_bl_test_end) >= 0) {
+            backlight_set(true);
+            test_off = false;
+            g_bl_test_end = 0;
+        }
+    }
     if (now - last_screen_ms >= SCREEN_CHECK_MS) {
         last_screen_ms = now;
         check_screen_timeout();
