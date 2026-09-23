@@ -227,7 +227,8 @@ static uint32_t g_bl_change_ms  = 0;
 static time_t   g_bl_change_time = 0;
 static bool     g_bl_driver_ok  = true;
 static bool     g_bl_exio_ok    = true;
-static uint32_t g_reasserts     = 0;              // "off" written again while blanked (write-only: see below)
+static uint32_t g_reasserts     = 0;              // "off" pushed to the chip again while blanked (see below)
+static uint32_t g_exp_cfg_fail  = 0;              // failed forced writes to the expander
 static uint32_t g_wakes         = 0;
 static uint32_t g_reassert_ms   = 0;
 
@@ -699,20 +700,50 @@ static void set_state_text(const char *text)
 
 // ---------- display timeout --------------------------------------------------
 
-// Switches the backlight. NEVER read the expander back: reading the CH422G means sending its "read IO" command,
-// which disturbs the output stage - the pins revert and the backlight comes on. That is what a read-back attempt
-// did here: every 5 s the read switched the light on and the code "corrected" it, 178 times in half an hour.
-// (Also note the vendor driver skips the I2C write entirely when the whole output byte would be zero, so never
-// rely on clearing the last remaining high pin - the LCD reset pin keeps the byte non-zero for us today.)
+// Backlight switching, and why it is done the way it is. Three findings, all from the van:
+//
+// 1. NEVER read the expander's pins. Reading the CH422G means sending its "read IO" command, which disturbs the
+//    output stage - the pins revert and the backlight comes on. A read-back check did exactly that: every 5 s the
+//    read switched the light on and the code "corrected" it, 178 times in half an hour.
+// 2. The vendor driver does not always write. digitalWrite() compares the new level with its own cached copy of
+//    the output register and sends nothing when they match (esp_io_expander_set_level, "Write to reg only when
+//    different"). So re-writing "off" is a no-op on the wire: in the van the light came back on by itself while
+//    96 such re-asserts all reported success without a single byte reaching the chip.
+// 3. Something in the van does change the chip's state behind the driver's back (a restart clears it; the bench
+//    never shows it). Two ways it can: the chip resets, and its output register returns to the power-on 0xFF -
+//    every pin high, backlight on; or it loses its "all IO output" setting and the pins float. Either way the
+//    driver's cache still says "off".
+//
+// So after switching, and periodically while blanked, push both the output mode and the cached output byte to
+// the chip unconditionally, through the driver's low-level write. Reading the *cached* byte is fine - it is
+// memory only; the harmful read is the chip's "read IO" command, which this never sends.
+// (The driver also skips the IO write when the whole byte would be zero; the LCD reset pin keeps it non-zero.)
+static bool expander_force_write()
+{
+    auto base = (g_board && g_board->getIO_Expander()) ? g_board->getIO_Expander()->getBase() : nullptr;
+    auto h = base ? base->getDeviceHandle() : nullptr;
+    if (!h || !h->read_output_reg || !h->write_output_reg) return false;
+
+    bool ok = static_cast<esp_expander::CH422G *>(base)->enableAllIO_Output();
+    uint32_t out = 0;
+    ok = (h->read_output_reg(h, &out) == ESP_OK) && ok;       // cached copy, no I2C traffic
+    if (g_bl_on) out |= (1u << BACKLIGHT_EXIO);
+    else         out &= ~(1u << BACKLIGHT_EXIO);
+    ok = (h->write_output_reg(h, out) == ESP_OK) && ok;       // always sent, unlike digitalWrite()
+    if (!ok) g_exp_cfg_fail++;
+    return ok;
+}
+
 static void backlight_set(bool on)
 {
     auto bl = g_board ? g_board->getBacklight() : nullptr;
     auto exp_dev = (g_board && g_board->getIO_Expander()) ? g_board->getIO_Expander()->getBase() : nullptr;
 
+    g_bl_on = on;
     g_bl_driver_ok = bl ? (on ? bl->on() : bl->off()) : false;
     g_bl_exio_ok   = exp_dev ? exp_dev->digitalWrite(BACKLIGHT_EXIO, on ? 1 : 0) : false;
+    g_bl_exio_ok   = expander_force_write() && g_bl_exio_ok;
 
-    g_bl_on = on;
     g_bl_change_ms = millis();
     g_bl_change_time = time(nullptr);
     g_reassert_ms = millis();
@@ -720,17 +751,13 @@ static void backlight_set(bool on)
                g_bl_exio_ok ? "ok" : "FAIL");
 }
 
-// While the screen is blanked, write "off" again every few seconds. A write that never reached the chip (the van
-// does show occasional I2C errors) would otherwise leave the panel lit until the next wake. Writing is harmless;
-// reading is not, so this only writes and only logs when the write fails.
+// While the screen is blanked, push the "off" state to the chip again every few seconds (see above).
 static void backlight_reassert()
 {
     if (!g_screen_off || millis() - g_reassert_ms < BL_REASSERT_MS) return;
     g_reassert_ms = millis();
-    auto exp_dev = (g_board && g_board->getIO_Expander()) ? g_board->getIO_Expander()->getBase() : nullptr;
-    if (!exp_dev) return;
     g_reasserts++;
-    if (!exp_dev->digitalWrite(BACKLIGHT_EXIO, 0)) {
+    if (!expander_force_write()) {
         g_bl_exio_ok = false;
         screen_log("re-assert write FAILED (%lu)", (unsigned long)g_reasserts);
     }
@@ -959,6 +986,8 @@ static void run_diagnostics()
     }
     size_t sl = strlen(sline);
     sl += snprintf(sline + sl, sizeof(sline) - sl, "   re-asserts: %lu", (unsigned long)g_reasserts);
+    if (g_exp_cfg_fail) sl += snprintf(sline + sl, sizeof(sline) - sl, "   expander write fails: %lu",
+                                       (unsigned long)g_exp_cfg_fail);
     static char slog[SCREEN_LOG_ROWS * 80 + 8];
     size_t ll = 0;
     slog[0] = '\0';
