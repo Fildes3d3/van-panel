@@ -157,7 +157,6 @@ static const char    *HOLD_OPTS      = "Until release\n5 s\n15 s\n60 s";
 static constexpr int  HOLD_DEFAULT   = 1;                      // 5 s
 static constexpr int      BACKLIGHT_EXIO   = 2;   // CH422G EXIO2 = backlight enable on this board (per its profile)
 static constexpr uint32_t BL_TEST_MS       = 5000;
-static constexpr int      BL_WRITE_TRIES    = 3;      // the expander write is on the shared I2C bus: verify it
 static constexpr uint32_t BL_REASSERT_MS    = 5000;   // while blanked, re-assert "off" in case a glitch flips it
 static constexpr uint32_t ERROR_FRESH_MS = 5UL * 60UL * 1000UL;  // status dot shows recent errors, not a latch
 
@@ -228,8 +227,7 @@ static uint32_t g_bl_change_ms  = 0;
 static time_t   g_bl_change_time = 0;
 static bool     g_bl_driver_ok  = true;
 static bool     g_bl_exio_ok    = true;
-static int      g_bl_readback   = -1;             // pin state read back after writing (-1 = read not available)
-static uint32_t g_bl_fixes      = 0;              // times the re-assert found the pin wrong and corrected it
+static uint32_t g_reasserts     = 0;              // "off" written again while blanked (write-only: see below)
 static uint32_t g_wakes         = 0;
 static uint32_t g_reassert_ms   = 0;
 
@@ -701,57 +699,40 @@ static void set_state_text(const char *text)
 
 // ---------- display timeout --------------------------------------------------
 
-// Switches the backlight and checks that it took. The expander sits on the same I2C bus as everything else, and
-// the van (unlike the bench) does produce occasional bus errors - a write that is reported as sent but never
-// reaches the chip would leave the backlight on while the screen is already blank, which is what was seen.
+// Switches the backlight. NEVER read the expander back: reading the CH422G means sending its "read IO" command,
+// which disturbs the output stage - the pins revert and the backlight comes on. That is what a read-back attempt
+// did here: every 5 s the read switched the light on and the code "corrected" it, 178 times in half an hour.
+// (Also note the vendor driver skips the I2C write entirely when the whole output byte would be zero, so never
+// rely on clearing the last remaining high pin - the LCD reset pin keeps the byte non-zero for us today.)
 static void backlight_set(bool on)
 {
     auto bl = g_board ? g_board->getBacklight() : nullptr;
     auto exp_dev = (g_board && g_board->getIO_Expander()) ? g_board->getIO_Expander()->getBase() : nullptr;
 
-    g_bl_driver_ok = false;
-    if (bl) g_bl_driver_ok = on ? bl->on() : bl->off();
-
-    g_bl_exio_ok = false;
-    g_bl_readback = -1;
-    for (int attempt = 1; attempt <= BL_WRITE_TRIES && exp_dev; attempt++) {
-        g_bl_exio_ok = exp_dev->digitalWrite(BACKLIGHT_EXIO, on ? 1 : 0);
-        g_bl_readback = exp_dev->digitalRead(BACKLIGHT_EXIO);
-        if (!g_bl_exio_ok) {
-            Serial.printf("[screen] EXIO%d write failed (attempt %d)\n", BACKLIGHT_EXIO, attempt);
-            continue;
-        }
-        if (g_bl_readback < 0) break;                 // no usable read-back: trust the write
-        if ((g_bl_readback != 0) == on) break;        // read-back agrees with what was asked for
-        Serial.printf("[screen] EXIO%d read back %d, wanted %d (attempt %d)\n", BACKLIGHT_EXIO, g_bl_readback,
-                      on ? 1 : 0, attempt);
-    }
+    g_bl_driver_ok = bl ? (on ? bl->on() : bl->off()) : false;
+    g_bl_exio_ok   = exp_dev ? exp_dev->digitalWrite(BACKLIGHT_EXIO, on ? 1 : 0) : false;
 
     g_bl_on = on;
     g_bl_change_ms = millis();
     g_bl_change_time = time(nullptr);
     g_reassert_ms = millis();
-    screen_log("backlight %s (driver %s, pin %s, read %s)", on ? "on" : "off", g_bl_driver_ok ? "ok" : "FAIL",
-               g_bl_exio_ok ? "ok" : "FAIL",
-               g_bl_readback < 0 ? "n/a" : (((g_bl_readback != 0) == on) ? "ok" : "MISMATCH"));
+    screen_log("backlight %s (driver %s, pin %s)", on ? "on" : "off", g_bl_driver_ok ? "ok" : "FAIL",
+               g_bl_exio_ok ? "ok" : "FAIL");
 }
 
-// While the screen is blanked, keep the pin at "off". If a disturbed I2C transfer ever flips it back, this puts
-// it right within a few seconds instead of leaving the panel lit.
+// While the screen is blanked, write "off" again every few seconds. A write that never reached the chip (the van
+// does show occasional I2C errors) would otherwise leave the panel lit until the next wake. Writing is harmless;
+// reading is not, so this only writes and only logs when the write fails.
 static void backlight_reassert()
 {
     if (!g_screen_off || millis() - g_reassert_ms < BL_REASSERT_MS) return;
     g_reassert_ms = millis();
     auto exp_dev = (g_board && g_board->getIO_Expander()) ? g_board->getIO_Expander()->getBase() : nullptr;
     if (!exp_dev) return;
-    int rb = exp_dev->digitalRead(BACKLIGHT_EXIO);
-    if (rb > 0) {                                     // pin is high again although the screen is blanked
-        g_bl_fixes++;
-        exp_dev->digitalWrite(BACKLIGHT_EXIO, 0);
-        if (g_board->getBacklight()) g_board->getBacklight()->off();
-        screen_log("backlight was ON while blanked - corrected (%lu)", (unsigned long)g_bl_fixes);
-    } else if (rb < 0) {
-        exp_dev->digitalWrite(BACKLIGHT_EXIO, 0);     // no read-back available: just write it again
+    g_reasserts++;
+    if (!exp_dev->digitalWrite(BACKLIGHT_EXIO, 0)) {
+        g_bl_exio_ok = false;
+        screen_log("re-assert write FAILED (%lu)", (unsigned long)g_reasserts);
     }
 }
 
@@ -977,7 +958,7 @@ static void run_diagnostics()
                  (unsigned long)g_wakes);
     }
     size_t sl = strlen(sline);
-    if (g_bl_fixes) sl += snprintf(sline + sl, sizeof(sline) - sl, "   corrections: %lu", (unsigned long)g_bl_fixes);
+    sl += snprintf(sline + sl, sizeof(sline) - sl, "   re-asserts: %lu", (unsigned long)g_reasserts);
     static char slog[SCREEN_LOG_ROWS * 80 + 8];
     size_t ll = 0;
     slog[0] = '\0';
