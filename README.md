@@ -77,7 +77,9 @@ pio run -t upload    # flash over USB
 
 ## Status
 
-Working in the van: all four channels read, the interface and the network features run.
+Bench-verified and tested live in the dash: all four channels read, the interface and the network features run. Final installation in the van is pending.
+
+![first live test in the dash, reading the Toptron through its own harness](docs/img/dash-test.jpeg)
 
 Still to do: connect to an EcoFlow power station over BLE.
 
