@@ -11,8 +11,8 @@
  *
  * Hardware (perfboard, van configuration):
  *   SIG+ --+-- 4.7k -- A0,  100 nF A0 -> board GND
- *        R_burden (499 ohm interim; final ~86 ohm)
- *   SIG- --+-- 4.36k -- A1, 100 nF A1 -> board GND
+ *        R_burden 100 ohm (final; was 499 ohm interim)
+ *   SIG- --+-- 4.7k -- A1,  100 nF A1 -> board GND   (matched pair since the 2026-09-29 perfboard)
  *   Board GND on its own wire to vehicle ground (NOT the Toptron ground / signal -).
  *
  * Measurement (unchanged from the tested Stage 4c v4):
@@ -46,7 +46,8 @@
  *   07h Days, 08h Weekdays (0-6), 09h Months (1-12), 0Ah Years (0-99, 2000-based). All BCD.
  *
  * ADS1115 (TI SBAS444): single-shot, OS-bit polling, comparator off. PGA bits 11:9: 001 +-4.096, 011 +-1.024,
- *   101 +-0.256 V. Signal at +-1.024 V with the 499 ohm interim burden; +-0.256 V once the ~86 ohm burden is fitted.
+ *   101 +-0.256 V. Signal at +-0.256 V with the 100 ohm burden (the 499 ohm interim needed +-1.024 V).
+ *   Expected span with 100 ohm: ~0-140 mV (16.5 V on the dial ~ 1.4 mA), well inside +-256 mV.
  *
  * I2C: the display library's legacy driver on port 0, i2c_master_* helpers only, no Wire, timeout 1000 ms.
  * LVGL is only touched from loop()/LVGL callbacks (core 1); the network task never calls LVGL.
@@ -125,13 +126,15 @@ struct Pga {
 };
 static constexpr Pga PGA_4V096  = {0x0200, 4.096f / 32768.0f};  // PGA = 001
 static constexpr Pga PGA_1V024  = {0x0600, 1.024f / 32768.0f};  // PGA = 011
-static constexpr Pga PGA_SIGNAL = PGA_1V024;                    // 499 ohm interim burden
-static constexpr const char *PGA_SIGNAL_TEXT = "+-1.024 V";
-static constexpr float BURDEN_OHM = 499.0f;
+static constexpr Pga PGA_0V256  = {0x0A00, 0.256f / 32768.0f};  // PGA = 101
+static constexpr Pga PGA_SIGNAL = PGA_0V256;                    // 100 ohm burden
+static constexpr const char *PGA_SIGNAL_TEXT = "+-0.256 V";
+static constexpr float BURDEN_OHM = 100.0f;                     // nominal; fitted 2026-09-29
 
 static constexpr uint32_t CONV_POLL_TIMEOUT_MS = 50;      // 128 SPS conversion is ~7.8 ms
 
-static constexpr float    PRESS_THRESHOLD_MV   = 5.0f;    // "none" reads ~0 through the burden
+static constexpr float    PRESS_THRESHOLD_MV   = 1.0f;    // "none" reads ~0 through the burden. Was 5 mV with
+                                                          // 499 ohm: same gauge current (~10 uA) at 100 ohm
 static constexpr int      CONFIRM_SAMPLES      = 3;       // consecutive positive samples before a press counts
 static constexpr uint32_t MIN_PRESS_MS         = 150;     // shorter "presses" are noise: logged, not displayed
 static constexpr uint32_t BOOT_IGNORE_MS       = 3000;    // power-up transient: the board's inrush current dips the
@@ -160,12 +163,16 @@ static constexpr uint32_t BL_TEST_MS       = 5000;
 static constexpr uint32_t BL_REASSERT_MS    = 5000;   // while blanked, re-assert "off" in case a glitch flips it
 static constexpr uint32_t ERROR_FRESH_MS = 5UL * 60UL * 1000UL;  // status dot shows recent errors, not a latch
 
-// PROVISIONAL volts calibration, 499 ohm burden: V = VOLT_OFFSET + VOLT_PER_MV * mV
-// from (265.3 mV, 12.82 V leisure, 2026-09-22) and (242.6 mV, 12.62 V car; battery V from 2026-09-21).
-// Checked against a 3rd point: ~240 mV -> 12.59 V vs 12.6 V measured. Redo in Stage 5 with the final ~86 ohm burden.
+// PROVISIONAL volts calibration: V = VOLT_OFFSET + VOLT_PER_MV * mV. Measured with the 499 ohm interim burden:
+// (265.3 mV, 12.82 V leisure, 2026-09-22) and (242.6 mV, 12.62 V car; battery V from 2026-09-21); 3rd point
+// ~240 mV -> 12.59 V vs 12.6 V measured. Carried over to the 100 ohm burden by scaling the mV by 499/100, which
+// assumes the Toptron drives a current that does not depend on the load (the leisure data showed no measurable
+// burden effect - not proven). Only a stop-gap until the Stage 5 two-point calibration replaces both numbers.
+static constexpr float PROV_BURDEN_OHM = 499.0f;
 static constexpr bool  VOLT_CALIBRATED = false;
-static constexpr float VOLT_PER_MV     = (12.82f - 12.62f) / (265.3f - 242.6f);   // ~0.00881 V/mV
-static constexpr float VOLT_OFFSET     = 12.82f - 265.3f * VOLT_PER_MV;           // ~10.48 V at 0 mV
+static constexpr float VOLT_PER_MV     = (12.82f - 12.62f) / (265.3f - 242.6f)
+                                         * (PROV_BURDEN_OHM / BURDEN_OHM);        // ~0.0440 V/mV
+static constexpr float VOLT_OFFSET     = 12.82f - 265.3f * (12.82f - 12.62f) / (265.3f - 242.6f);  // ~10.48 V
 
 // Gauge dial: one needle over two aligned linear scales
 static constexpr float DIAL_V_MIN      = 8.0f;    // left end: 8 V / empty
