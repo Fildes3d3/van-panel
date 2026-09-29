@@ -7,7 +7,8 @@
  *   - It is a ~mA gauge drive, not a stiff voltage. The original gauge is 85.8 ohm.
  *   - Battery channels and the clean tank are steady while held; grey decays (dirty sender suspected).
  *   - The original gauge dial: ONE needle, two aligned linear scales - 8/10/12/14/16 V on top and
- *     0/(1/4)/(1/2)/(3/4)/(1/1) below. So tank % = (V_scale - 8) / 8 * 100; one battery calibration gives both.
+ *     0/(1/4)/(1/2)/(3/4)/(1/1) below. The calibrated line puts 0 mV at ~9.95 V, not 8 V, so the dial formula can
+ *     never show an empty tank (floor 24 %); tanks therefore have their own zero - see TANK_EMPTY_MV.
  *
  * Hardware (perfboard, van configuration):
  *   SIG+ --+-- 4.7k -- A0,  100 nF A0 -> board GND
@@ -163,16 +164,23 @@ static constexpr uint32_t BL_TEST_MS       = 5000;
 static constexpr uint32_t BL_REASSERT_MS    = 5000;   // while blanked, re-assert "off" in case a glitch flips it
 static constexpr uint32_t ERROR_FRESH_MS = 5UL * 60UL * 1000UL;  // status dot shows recent errors, not a latch
 
-// PROVISIONAL volts calibration: V = VOLT_OFFSET + VOLT_PER_MV * mV. Measured with the 499 ohm interim burden:
-// (265.3 mV, 12.82 V leisure, 2026-09-22) and (242.6 mV, 12.62 V car; battery V from 2026-09-21); 3rd point
-// ~240 mV -> 12.59 V vs 12.6 V measured. Carried over to the 100 ohm burden by scaling the mV by 499/100, which
-// assumes the Toptron drives a current that does not depend on the load (the leisure data showed no measurable
-// burden effect - not proven). Only a stop-gap until the Stage 5 two-point calibration replaces both numbers.
-static constexpr float PROV_BURDEN_OHM = 499.0f;
-static constexpr bool  VOLT_CALIBRATED = false;
-static constexpr float VOLT_PER_MV     = (12.82f - 12.62f) / (265.3f - 242.6f)
-                                         * (PROV_BURDEN_OHM / BURDEN_OHM);        // ~0.0440 V/mV
-static constexpr float VOLT_OFFSET     = 12.82f - 265.3f * (12.82f - 12.62f) / (265.3f - 242.6f);  // ~10.48 V
+// Volts calibration, 100 ohm burden: V = VOLT_OFFSET + VOLT_PER_MV * mV. Two-point, leisure battery, 2026-09-29,
+// battery voltage read at the terminals while the rocker was held; mV = the Diag "@0.5s" value:
+//   charger off: 12.55 V <-> 51.17 mV (press #2)
+//   charger on : 14.07 V <-> 81.05 mV (presses #6/#7: 80.99, 81.10)
+// Only verified between 12.55 and 14.07 V; below and above that it is an extrapolation of a straight line.
+// The same line is used for the car battery and, through the dial formula, for the tanks (one needle, one gauge).
+static constexpr float CAL_MV_LO = 51.17f, CAL_V_LO = 12.55f;
+static constexpr float CAL_MV_HI = 81.05f, CAL_V_HI = 14.07f;
+static constexpr bool  VOLT_CALIBRATED = true;
+static constexpr float VOLT_PER_MV     = (CAL_V_HI - CAL_V_LO) / (CAL_MV_HI - CAL_MV_LO);   // ~0.05088 V/mV
+static constexpr float VOLT_OFFSET     = CAL_V_LO - CAL_MV_LO * VOLT_PER_MV;               // ~9.95 V at 0 mV
+
+// Tank percent: own zero, measured - the grey tank EMPTY read 19.5 mV (2026-09-29; the original gauge was not at 0
+// for an empty tank either). The full end is still the dial's: the mV that the calibrated line puts at 16 V (~119 mV)
+// - an assumption until a full tank has been read. Both tanks share it (one gauge, one needle).
+static constexpr float TANK_EMPTY_MV = 19.5f;
+static constexpr float TANK_FULL_MV  = (16.0f - VOLT_OFFSET) / VOLT_PER_MV;   // ~119 mV
 
 // Gauge dial: one needle over two aligned linear scales
 static constexpr float DIAL_V_MIN      = 8.0f;    // left end: 8 V / empty
@@ -664,7 +672,8 @@ static void show_value(float mv)
         return;
     }
     float frac  = (volts - DIAL_V_MIN) / (DIAL_V_MAX - DIAL_V_MIN);
-    float pct   = clampf(frac, 0, 1) * 100.0f;
+    float tfrac = (mv - TANK_EMPTY_MV) / (TANK_FULL_MV - TANK_EMPTY_MV);
+    float pct   = clampf(tfrac, 0, 1) * 100.0f;
     bool  red   = volts < RED_LOW_V || volts > RED_HIGH_V;
     char v[16], p[16];
     snprintf(v, sizeof(v), "%.1f V", volts);
@@ -676,7 +685,7 @@ static void show_value(float mv)
     lv_obj_set_style_text_color(lbl_volt, red ? COL_WARN : COL_TEXT, 0);
     lv_obj_set_style_text_color(lbl_pct, COL_TEXT, 0);
     place_marker(mk_bat, BAT_BAR_Y, frac);
-    place_marker(mk_wat, WAT_BAR_Y, frac);
+    place_marker(mk_wat, WAT_BAR_Y, tfrac);
     lvgl_port_unlock();
 
     g_display_ms = millis();
@@ -948,7 +957,7 @@ static void run_diagnostics()
     float a0 = NAN, a1 = NAN;
     bool ok0 = ads_read_volts(MUX_AIN0, PGA_4V096, &a0);
     bool ok1 = ads_read_volts(MUX_AIN1, PGA_4V096, &a1);
-    char s0[16], s1[16], line[300];
+    char s0[16], s1[16], line[400];
     if (ok0) snprintf(s0, sizeof(s0), "%.4f", a0); else snprintf(s0, sizeof(s0), "ERR");
     if (ok1) snprintf(s1, sizeof(s1), "%.4f", a1); else snprintf(s1, sizeof(s1), "ERR");
     uint32_t s = millis() / 1000;
@@ -967,12 +976,13 @@ static void run_diagnostics()
     snprintf(line, sizeof(line),
              "Idle: A0 %s V   A1 %s V (signal- vs board GND)   I2C/ADC errors: %lu%s\n"
              "Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
-             "\nVolts %s: V = %.3f + %.5f x mV   %% = (V - 8) / 8 per gauge dial",
+             "\nVolts %s: V = %.3f + %.5f x mV   tank %% = (mV - %.1f) / (%.1f - %.1f)",
              s0, s1, (unsigned long)g_read_errors, err_when, (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60),
              (unsigned long)(s % 60), (unsigned long)g_press.n, (unsigned long)g_rejected,
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV);
+             VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV,
+             TANK_EMPTY_MV, TANK_FULL_MV, TANK_EMPTY_MV);
     char sline[260];
     if (g_bl_change_ms) {
         uint32_t ago = (millis() - g_bl_change_ms) / 1000;
