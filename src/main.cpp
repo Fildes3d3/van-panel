@@ -18,7 +18,9 @@
  *
  * Measurement (unchanged from the tested Stage 4c v4):
  *   - Polls A0-A1 (differential) every ~50 ms. |V| > PRESS_THRESHOLD_MV = a selector is held.
- *   - While held: ~100 samples/s. Displayed value = max |mV| in 0.1-0.5 s after press start; held DISPLAY_HOLD_MS.
+ *   - While held: ~100 samples/s. The value is shown live (every LIVE_UI_MS, from 0.1 s on, like the old needle);
+ *     on release the value from ~0.2 s before release stays on screen. The tank rods need seconds to settle after
+ *     a rest (21:08, 2026-10-08: 41.8 mV at the start, 47.0 at 0.5 s, 56.8 at the end), so the end is the best value.
  *   - The board does NOT know which selector is pressed (user decision): every press is shown both as volts and as
  *     percent, same size; the user reads the one that applies. Volts turn red in the dial's red zones.
  *     How long that value stays after the selector is released is set in Settings > Display ("Keep reading":
@@ -169,9 +171,11 @@ static constexpr uint32_t NET_UI_PERIOD_MS     = 300;
 static constexpr uint32_t LOG_FAST_MS          = 3000;    // serial: every sample during the first 3 s of a press
 static constexpr uint32_t LOG_SLOW_MS          = 100;
 
-// Display value capture window and hold
+// Display: live while held, from WIN_START_MS on (skips the rocker's contact transient); WIN_END_MS only bounds the
+// early-window value kept for the diagnostics table.
 static constexpr uint32_t WIN_START_MS    = 100;
 static constexpr uint32_t WIN_END_MS      = 500;
+static constexpr uint32_t LIVE_UI_MS      = 250;
 static const uint16_t HOLD_SECONDS[] = {0, 5, 15, 60};        // 0 = clear as soon as the selector is released
 static const char    *HOLD_OPTS      = "Until release\n5 s\n15 s\n60 s";
 static constexpr int  HOLD_DEFAULT   = 1;                      // 5 s
@@ -373,7 +377,8 @@ struct Press {
     int      below       = 0;
     bool     active      = false;
     float    win_mv      = NAN;    // max |mV| inside the capture window
-    bool     shown       = false;  // display value already published for this press
+    bool     shown       = false;  // a value has been published for this press
+    uint32_t live_ms     = 0;      // millis() of the last live update
 };
 static constexpr uint32_t AT_MS[4] = {200, 500, 1000, 2000};
 static Press g_press;
@@ -703,10 +708,11 @@ static float tank_frac(float mv)
     return roundf(t * TANK_STEPS) / TANK_STEPS;
 }
 
-static void show_value(float mv)
+static void show_value(float mv, bool live = false)
 {
     float volts = VOLT_OFFSET + VOLT_PER_MV * mv;
     if (volts > PLAUSIBLE_MAX_V) {                // cannot be a real gauge reading - do not display it
+        if (live) return;                         // judged once, on the final value
         g_rejected++;
         Serial.printf("[display] REJECTED %.2f mV -> %.2f V (above %.1f V; total %lu)\n", mv, volts,
                       PLAUSIBLE_MAX_V, (unsigned long)g_rejected);
@@ -937,9 +943,10 @@ static void press_sample(float mv)
     if (t >= WIN_START_MS && t <= WIN_END_MS && (isnan(g_press.win_mv) || fabsf(mv) > fabsf(g_press.win_mv))) {
         g_press.win_mv = mv;
     }
-    if (!g_press.shown && t > WIN_END_MS && !isnan(g_press.win_mv)) {
-        g_press.shown = true;
-        show_value(g_press.win_mv);
+    if (t >= WIN_START_MS && (!g_press.shown || millis() - g_press.live_ms >= LIVE_UI_MS)) {
+        g_press.shown   = true;
+        g_press.live_ms = millis();
+        show_value(mv, true);
     }
     if (t < LOG_FAST_MS || t - g_press.last_log_ms >= LOG_SLOW_MS) {
         Serial.printf("[press] #%lu t=%5lu ms  %8.3f mV\n", (unsigned long)g_press.n, (unsigned long)t, mv);
@@ -951,17 +958,16 @@ static void press_end()
 {
     g_press.active = false;
     uint32_t dur = millis() - g_press.start_ms;
-    if (!g_press.shown) {
-        if (dur >= MIN_PRESS_MS) {
-            show_value(!isnan(g_press.win_mv) ? g_press.win_mv : g_press.peak_mv);
-        } else {
-            Serial.printf("[press] #%lu ignored: %lu ms < %lu ms\n", (unsigned long)g_press.n, (unsigned long)dur,
-                          (unsigned long)MIN_PRESS_MS);
-            set_state_text(g_display_ms ? "Held reading" : "Hold a selector on the panel");
-        }
-        g_press.shown = true;
+    // value ~0.2 s before release (the release edge itself is excluded); short presses: the last sample
+    float end_mv = g_recent_count > END_BACK_SAMPLES ? g_recent[g_recent_head] : g_press.last_mv;
+    if (dur >= MIN_PRESS_MS) {
+        show_value(end_mv);                       // the settled value stays on screen
+    } else {
+        Serial.printf("[press] #%lu ignored: %lu ms < %lu ms\n", (unsigned long)g_press.n, (unsigned long)dur,
+                      (unsigned long)MIN_PRESS_MS);
+        set_state_text(g_display_ms ? "Held reading" : "Hold a selector on the panel");
     }
-    float end_mv = g_recent_count > END_BACK_SAMPLES ? g_recent[g_recent_head] : g_press.first_mv;
+    g_press.shown = true;
 
     char a[4][12];
     for (int i = 0; i < 4; i++) fmt_opt(a[i], sizeof(a[i]), g_press.at_mv[i]);
@@ -971,7 +977,7 @@ static void press_end()
                   a[1], a[2], a[3], g_press.peak_mv, end_mv, g_press.win_mv);
 
     {
-        float shown = !isnan(g_press.win_mv) ? g_press.win_mv : g_press.peak_mv;
+        float shown = end_mv;
         float volts = VOLT_OFFSET + VOLT_PER_MV * shown;
         float pct   = tank_frac(shown) * 100.0f;
         vlog("PRESS #%lu %.1fs first %.2f @0.5s %s end %.2f peak %.2f mV -> %.2f V / %.0f %%",
