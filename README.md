@@ -44,6 +44,9 @@ Each of these came from measurements, several of them after a wrong assumption w
 - **Clock:** kept by the board's RTC and set from the internet when Wi-Fi is available.
 - **Settings:** clock, Wi-Fi (scan, on-screen keyboard), Bluetooth, weather location, display
   timeout, and a diagnostics page with the raw measurements.
+- **Event log:** boots (with the reset reason), every reading, screen events and a once-a-minute health
+  sample are kept on the board's flash and read over USB (`log` at 115200 baud) — for finding out what
+  happened in the van after the fact.
 - **Display timeout:** the screen blanks and the backlight switches off after a chosen time; a touch
   or a selector press wakes it. The image is blanked, not just darkened, because an LCD showing a
   static picture in the dark still suffers image retention.
@@ -65,6 +68,7 @@ separate wire so its return current never flows through the Toptron's ground.
 PlatformIO with the pioarduino platform (Arduino-ESP32 3.1.1) and LVGL 8.4.
 
 - `src/main.cpp` — measurement, the three pages, settings, RTC, display timeout
+- `src/vlog.{h,cpp}` — the event log (LittleFS on the spare flash partition)
 - `src/net.{h,cpp}` — Wi-Fi, NTP, weather and BLE, on their own task on the second core so network
   waits never disturb the sampling
 - `src/fonts/` — fonts generated with `lv_font_conv` from the fonts bundled with LVGL
