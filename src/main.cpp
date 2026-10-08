@@ -64,7 +64,11 @@
 #include <esp_heap_caps.h>
 #include "lvgl_v8_port.h"
 #include "net.h"
+#include "vlog.h"
 #include <Preferences.h>
+#include <esp_system.h>
+#include <esp_core_dump.h>
+#include <esp_app_desc.h>
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -268,6 +272,7 @@ static void screen_log(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
+    vlog("SCREEN %s", buf);
     for (int i = SCREEN_LOG_ROWS - 1; i > 0; i--) g_scr_log[i] = g_scr_log[i - 1];
     g_scr_log[0].when = time(nullptr);
     g_scr_log[0].ms   = millis();
@@ -523,6 +528,13 @@ static void note_error(esp_err_t err, const char *where)
     g_last_error_time = time(nullptr);
     Serial.printf("[ads] error: %s during %s (total %lu)\n", esp_err_to_name(err), where,
                   (unsigned long)g_read_errors);
+    static uint32_t last_logged_ms = 0, logged_total = 0;
+    if (!last_logged_ms || millis() - last_logged_ms >= 10000) {
+        vlog("I2C error %s during %s (total %lu, %lu since last line)", esp_err_to_name(err), where,
+             (unsigned long)g_read_errors, (unsigned long)(g_read_errors - logged_total));
+        last_logged_ms = millis();
+        logged_total = g_read_errors;
+    }
 }
 
 // Single-shot conversion. Returns true and the value in volts on success.
@@ -832,6 +844,7 @@ static void hold_dd_cb(lv_event_t *e)
     p.putUChar("hold", (uint8_t)g_hold_idx);
     p.end();
     Serial.printf("[display] keep reading: %u s (0 = until release)\n", HOLD_SECONDS[g_hold_idx]);
+    vlog("SETTING keep reading %u s (0 = until release)", HOLD_SECONDS[g_hold_idx]);
 }
 
 static void bl_test_cb(lv_event_t *e)
@@ -850,6 +863,7 @@ static void timeout_dd_cb(lv_event_t *e)
     p.putUChar("disp_to", (uint8_t)g_timeout_idx);
     p.end();
     Serial.printf("[screen] timeout set to %u min (0 = never)\n", TIMEOUT_MIN[g_timeout_idx]);
+    vlog("SETTING display timeout %u min (0 = never)", TIMEOUT_MIN[g_timeout_idx]);
 }
 
 // ---------- press handling ---------------------------------------------------
@@ -931,6 +945,14 @@ static void press_end()
                   "peak %.2f  end(-0.2s) %.2f  window %.2f mV\n",
                   (unsigned long)g_press.n, dur / 1000.0f, (unsigned long)g_press.samples, g_press.first_mv, a[0],
                   a[1], a[2], a[3], g_press.peak_mv, end_mv, g_press.win_mv);
+
+    {
+        float shown = !isnan(g_press.win_mv) ? g_press.win_mv : g_press.peak_mv;
+        float volts = VOLT_OFFSET + VOLT_PER_MV * shown;
+        float pct   = clampf((shown - TANK_EMPTY_MV) / (TANK_FULL_MV - TANK_EMPTY_MV), 0, 1) * 100.0f;
+        vlog("PRESS #%lu %.1fs first %.2f @0.5s %s end %.2f peak %.2f mV -> %.2f V / %.0f %%",
+             (unsigned long)g_press.n, dur / 1000.0f, g_press.first_mv, a[1], end_mv, g_press.peak_mv, volts, pct);
+    }
 
     for (int i = HISTORY_ROWS - 1; i > 0; i--) g_hist[i] = g_hist[i - 1];
     HistoryRow &r = g_hist[0];
@@ -1737,6 +1759,11 @@ static void update_net_ui()
     net_get(&n);
     if (n.version == last_version) return;
     last_version = n.version;
+    if (n.connected != g_ns.connected) {
+        if (n.connected) vlog("WIFI connected to %s (%d dBm)", n.ssid, n.rssi);
+        else             vlog("WIFI disconnected");
+    }
+    if (n.ble_enabled != g_ns.ble_enabled) vlog("BT %s", n.ble_enabled ? "on" : "off");
     g_ns = n;
 
     lvgl_port_lock(-1);
@@ -1811,6 +1838,92 @@ static void update_rtc_status()
 
 // ---------- Arduino entry points ---------------------------------------------
 
+// ---------- persistent log: boot record, periodic sample, USB commands --------------------------------------
+
+static const char *reset_reason_text(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:   return "POWER-ON (power was off or applied)";
+    case ESP_RST_EXT:       return "EXTERNAL PIN";
+    case ESP_RST_SW:        return "SOFTWARE";
+    case ESP_RST_PANIC:     return "CRASH (panic)";
+    case ESP_RST_INT_WDT:   return "INTERRUPT WATCHDOG";
+    case ESP_RST_TASK_WDT:  return "TASK WATCHDOG";
+    case ESP_RST_WDT:       return "OTHER WATCHDOG";
+    case ESP_RST_DEEPSLEEP: return "DEEP SLEEP";
+    case ESP_RST_BROWNOUT:  return "BROWN-OUT (supply dipped too low)";
+    case ESP_RST_SDIO:      return "SDIO";
+    case ESP_RST_USB:       return "USB (reset or flashing over USB)";
+    case ESP_RST_JTAG:      return "JTAG";
+    default:                return "UNKNOWN";
+    }
+}
+
+static void log_boot()
+{
+    Preferences p;
+    p.begin("globebus", false);
+    uint32_t boots = p.getULong("boots", 0) + 1;
+    p.putULong("boots", boots);
+    p.end();
+    esp_reset_reason_t r = esp_reset_reason();
+    // A dump stays on flash until a newer crash overwrites it, so say whether it belongs to this firmware.
+    char dump[140] = "none";
+    if (esp_core_dump_image_check() == ESP_OK) {
+        static esp_core_dump_summary_t sum;
+        if (esp_core_dump_get_summary(&sum) == ESP_OK) {
+            char mine[10];
+            esp_app_get_elf_sha256(mine, sizeof(mine));
+            bool same = strncmp((const char *)sum.app_elf_sha256, mine, sizeof(mine) - 1) == 0;
+            snprintf(dump, sizeof(dump), "%s firmware (%.9s), task %s, cause %lu at PC 0x%08lx, address 0x%08lx",
+                     same ? "THIS" : "an older", (const char *)sum.app_elf_sha256, sum.exc_task,
+                     (unsigned long)sum.ex_info.exc_cause, (unsigned long)sum.exc_pc,
+                     (unsigned long)sum.ex_info.exc_vaddr);
+        } else {
+            snprintf(dump, sizeof(dump), "present (unreadable)");
+        }
+    }
+    vlog("BOOT #%lu reset: %s (%d); firmware built " __DATE__ " " __TIME__ "; crash dump on flash: %s",
+         (unsigned long)boots, reset_reason_text(r), (int)r, dump);
+}
+
+// Once a minute (and never during a press): how the board and the Toptron input look at rest.
+static void log_sample()
+{
+    float a0 = NAN, a1 = NAN;
+    ads_read_volts(MUX_AIN0, PGA_4V096, &a0);
+    ads_read_volts(MUX_AIN1, PGA_4V096, &a1);
+    vlog("SAMPLE gnd A0 %.1f A1 %.1f mV, idle A0-A1 %.3f mV, i2c errors %lu, stuck %lu, heap %lu/%lu B, "
+         "wifi %s %d dBm, screen %s",
+         a0 * 1000.0f, a1 * 1000.0f, g_idle_mv, (unsigned long)g_read_errors, (unsigned long)g_stuck,
+         (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned long)ESP.getFreeHeap(),
+         g_ns.connected ? "on" : "off", g_ns.connected ? g_ns.rssi : 0, g_screen_off ? "dark" : "on");
+}
+
+// Serial commands (115200 baud): log, loginfo, logflush, logclear, help
+static void handle_serial()
+{
+    static char cmd[24];
+    static size_t n = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c != '\n' && c != '\r') {
+            if (n < sizeof(cmd) - 1) cmd[n++] = c;
+            continue;
+        }
+        if (!n) continue;
+        cmd[n] = 0;
+        n = 0;
+        if (!strcmp(cmd, "log"))           vlog_dump(Serial);
+        else if (!strcmp(cmd, "loginfo"))  vlog_info(Serial);
+        else if (!strcmp(cmd, "logflush")) { vlog_flush(); vlog_info(Serial); }
+        else if (!strcmp(cmd, "logclear")) { vlog_clear(); Serial.println("[log] cleared"); }
+        else if (!strcmp(cmd, "logtest"))  vlog_flash_test(Serial, 32 * 1024);
+        else Serial.println("commands: log (print the stored log), loginfo, logflush (write pending now), logclear, "
+                            "logtest (timed 32 KB scratch write, to check the display)");
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -1831,6 +1944,8 @@ void setup()
     }
 
     system_time_from_rtc();
+    vlog_begin();
+    log_boot();
 
     {
         Preferences p;
@@ -1894,6 +2009,17 @@ void loop()
         return;   // sample again immediately
     }
 
+    handle_serial();
+    vlog_poll(g_screen_off, false);
+    {
+        static uint32_t last_sample_ms = 0;
+        if (millis() - last_sample_ms >= 60000UL || !last_sample_ms) {
+            last_sample_ms = millis();
+            if (last_sample_ms > BOOT_IGNORE_MS) log_sample();
+            else last_sample_ms = 0;
+        }
+    }
+
     if (g_rescan_requested) {
         g_rescan_requested = false;
         run_scan();
@@ -1913,6 +2039,7 @@ void loop()
     }
     if (g_ntp_synced) {
         g_ntp_synced = false;
+        vlog("TIME set from the internet");
         rtc_from_system_time("internet time");
         last_clock_ms = 0;
     }
