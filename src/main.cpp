@@ -144,6 +144,14 @@ static constexpr float    PRESS_THRESHOLD_MV   = 5.0f;    // "none" reads ~0 thr
                                                           // smallest real signals are ~11 mV (10.5 V battery) and
                                                           // 19.5 mV (empty tank); 5 mV = 10.2 V on the line.
 static constexpr uint32_t MAX_PRESS_MS         = 30000;   // the rockers are momentary: nothing real lasts this long
+// Open-input detector. With the 100 ohm burden across SIG+/SIG-, A0 and A1 can never be further apart than the
+// burden voltage (~130 mV at 16.5 V, ~0 at rest). In the van (2026-10-08) A0 wandered 200-900 mV from A1 for
+// minutes: the A0 path had lost its connection and every press was ignored or rejected. Checked at rest only.
+// Only visible on van power: on USB the whole board floats and an open A0 reads ~0 like a good one.
+static constexpr uint32_t WIRE_CHECK_MS        = 2000;
+static constexpr float    WIRE_LOOSE_MV        = 150.0f;  // |A0 - A1| above this, twice in a row = open
+static constexpr float    WIRE_OK_MV           = 20.0f;   // below this for WIRE_OK_CHECKS in a row = connected again
+static constexpr int      WIRE_OK_CHECKS       = 10;
 static constexpr int      CONFIRM_SAMPLES      = 3;       // consecutive positive samples before a press counts
 static constexpr uint32_t MIN_PRESS_MS         = 150;     // shorter "presses" are noise: logged, not displayed
 static constexpr uint32_t BOOT_IGNORE_MS       = 3000;    // power-up transient: the board's inrush current dips the
@@ -377,6 +385,8 @@ static int        g_hist_count = 0;
 static int      g_idle_ok    = 0;                 // consecutive quiet readings (see IDLE_CONFIRM_SAMPLES)
 static float    g_idle_mv    = NAN;               // latest idle A0-A1 at the signal PGA (offset with nothing held)
 static uint32_t g_stuck      = 0;                 // "presses" ended by MAX_PRESS_MS
+static bool     g_wire_loose = false;             // open-input detector state (see WIRE_LOOSE_MV)
+static uint32_t g_wire_events = 0;
 static uint32_t g_rejected   = 0;                 // implausible values not displayed
 static uint32_t g_display_ms = 0;                 // when the displayed value was published (0 = nothing shown)
 static NetState g_ns;                             // last copy of the network state (loop task only)
@@ -1005,11 +1015,12 @@ static void run_diagnostics()
     }
     snprintf(line, sizeof(line),
              "Idle: A0 %s V   A1 %s V (signal- vs board GND)   A0-A1 %s mV   I2C/ADC errors: %lu%s\n"
-             "Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
+             "Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   wire %s (%lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
              "\nVolts %s: V = %.3f + %.5f x mV   tank %% = (mV - %.1f) / (%.1f - %.1f)",
              s0, s1, sd, (unsigned long)g_read_errors, err_when, (unsigned long)(s / 3600),
              (unsigned long)((s / 60) % 60), (unsigned long)(s % 60), (unsigned long)g_press.n,
-             (unsigned long)g_rejected, (unsigned long)g_stuck,
+             (unsigned long)g_rejected, (unsigned long)g_stuck, g_wire_loose ? "OPEN" : "ok",
+             (unsigned long)g_wire_events,
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV,
@@ -1900,6 +1911,40 @@ static void log_sample()
          g_ns.connected ? "on" : "off", g_ns.connected ? g_ns.rssi : 0, g_screen_off ? "dark" : "on");
 }
 
+static void wire_check()
+{
+    static int      bad = 0, good = 0;
+    static uint32_t since_ms = 0;
+    static float    max_mv = 0;
+    float a0, a1;
+    if (!ads_read_volts(MUX_AIN0, PGA_4V096, &a0) || !ads_read_volts(MUX_AIN1, PGA_4V096, &a1)) return;
+    float d = fabsf(a0 - a1) * 1000.0f;
+    if (!g_wire_loose) {
+        bad = d > WIRE_LOOSE_MV ? bad + 1 : 0;
+        if (bad < 2) return;
+        g_wire_loose = true;
+        g_wire_events++;
+        since_ms = millis();
+        max_mv = d;
+        good = 0;
+        vlog("WIRE signal input looks OPEN: A0 %.0f mV, A1 %.0f mV vs board GND (apart %.0f mV) - presses ignored",
+             a0 * 1000.0f, a1 * 1000.0f, d);
+        set_state_text("Signal wire loose? Rockers ignored");
+        return;
+    }
+    if (d > max_mv) max_mv = d;
+    good = d < WIRE_OK_MV ? good + 1 : 0;
+    if (good < WIRE_OK_CHECKS) {
+        set_state_text("Signal wire loose? Rockers ignored");   // keep it up; other code may have replaced it
+        return;
+    }
+    g_wire_loose = false;
+    bad = 0;
+    vlog("WIRE signal input connected again after %lu s (A0/A1 were up to %.0f mV apart)",
+         (unsigned long)((millis() - since_ms) / 1000), max_mv);
+    set_state_text(g_display_ms ? "Held reading" : "Hold a selector on the panel");
+}
+
 // Serial commands (115200 baud): log, loginfo, logflush, logclear, help
 static void handle_serial()
 {
@@ -2018,6 +2063,11 @@ void loop()
             if (last_sample_ms > BOOT_IGNORE_MS) log_sample();
             else last_sample_ms = 0;
         }
+        static uint32_t last_wire_ms = 0;
+        if (millis() > BOOT_IGNORE_MS && millis() - last_wire_ms >= WIRE_CHECK_MS) {
+            last_wire_ms = millis();
+            wire_check();
+        }
     }
 
     if (g_rescan_requested) {
@@ -2055,6 +2105,8 @@ void loop()
             if (g_idle_ok < IDLE_CONFIRM_SAMPLES) g_idle_ok++;
         } else if (now < BOOT_IGNORE_MS) {
             Serial.printf("[press] ignored during boot settle: %.2f mV\n", v * 1000.0f);
+        } else if (g_wire_loose) {
+            // an open A0 produces random "readings"; never show them
         } else if (g_idle_ok < IDLE_CONFIRM_SAMPLES) {
             Serial.printf("[press] ignored: input not quiet yet (%.2f mV)\n", v * 1000.0f);
         } else {
