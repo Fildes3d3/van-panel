@@ -134,8 +134,12 @@ static constexpr float BURDEN_OHM = 100.0f;                     // nominal; fitt
 
 static constexpr uint32_t CONV_POLL_TIMEOUT_MS = 50;      // 128 SPS conversion is ~7.8 ms
 
-static constexpr float    PRESS_THRESHOLD_MV   = 1.0f;    // "none" reads ~0 through the burden. Was 5 mV with
-                                                          // 499 ohm: same gauge current (~10 uA) at 100 ohm
+static constexpr float    PRESS_THRESHOLD_MV   = 5.0f;    // "none" reads ~0 through the burden. 1 mV (the old
+                                                          // 499 ohm threshold scaled by current) latched a "press"
+                                                          // on a small idle offset in the van: stuck on 10.0 V. The
+                                                          // smallest real signals are ~11 mV (10.5 V battery) and
+                                                          // 19.5 mV (empty tank); 5 mV = 10.2 V on the line.
+static constexpr uint32_t MAX_PRESS_MS         = 30000;   // the rockers are momentary: nothing real lasts this long
 static constexpr int      CONFIRM_SAMPLES      = 3;       // consecutive positive samples before a press counts
 static constexpr uint32_t MIN_PRESS_MS         = 150;     // shorter "presses" are noise: logged, not displayed
 static constexpr uint32_t BOOT_IGNORE_MS       = 3000;    // power-up transient: the board's inrush current dips the
@@ -366,6 +370,8 @@ static HistoryRow g_hist[HISTORY_ROWS];
 static int        g_hist_count = 0;
 
 static int      g_idle_ok    = 0;                 // consecutive quiet readings (see IDLE_CONFIRM_SAMPLES)
+static float    g_idle_mv    = NAN;               // latest idle A0-A1 at the signal PGA (offset with nothing held)
+static uint32_t g_stuck      = 0;                 // "presses" ended by MAX_PRESS_MS
 static uint32_t g_rejected   = 0;                 // implausible values not displayed
 static uint32_t g_display_ms = 0;                 // when the displayed value was published (0 = nothing shown)
 static NetState g_ns;                             // last copy of the network state (loop task only)
@@ -957,7 +963,9 @@ static void run_diagnostics()
     float a0 = NAN, a1 = NAN;
     bool ok0 = ads_read_volts(MUX_AIN0, PGA_4V096, &a0);
     bool ok1 = ads_read_volts(MUX_AIN1, PGA_4V096, &a1);
-    char s0[16], s1[16], line[400];
+    char s0[16], s1[16], sd[16], line[440];
+    if (isnan(g_idle_mv)) snprintf(sd, sizeof(sd), "--");
+    else                  snprintf(sd, sizeof(sd), "%.3f", g_idle_mv);
     if (ok0) snprintf(s0, sizeof(s0), "%.4f", a0); else snprintf(s0, sizeof(s0), "ERR");
     if (ok1) snprintf(s1, sizeof(s1), "%.4f", a1); else snprintf(s1, sizeof(s1), "ERR");
     uint32_t s = millis() / 1000;
@@ -974,11 +982,12 @@ static void run_diagnostics()
         }
     }
     snprintf(line, sizeof(line),
-             "Idle: A0 %s V   A1 %s V (signal- vs board GND)   I2C/ADC errors: %lu%s\n"
-             "Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
+             "Idle: A0 %s V   A1 %s V (signal- vs board GND)   A0-A1 %s mV   I2C/ADC errors: %lu%s\n"
+             "Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
              "\nVolts %s: V = %.3f + %.5f x mV   tank %% = (mV - %.1f) / (%.1f - %.1f)",
-             s0, s1, (unsigned long)g_read_errors, err_when, (unsigned long)(s / 3600), (unsigned long)((s / 60) % 60),
-             (unsigned long)(s % 60), (unsigned long)g_press.n, (unsigned long)g_rejected,
+             s0, s1, sd, (unsigned long)g_read_errors, err_when, (unsigned long)(s / 3600),
+             (unsigned long)((s / 60) % 60), (unsigned long)(s % 60), (unsigned long)g_press.n,
+             (unsigned long)g_rejected, (unsigned long)g_stuck,
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV,
@@ -1867,6 +1876,15 @@ void loop()
         float v;
         if (!ads_read_volts(MUX_DIFF_01, PGA_SIGNAL, &v)) return;
         float mv = v * 1000.0f;
+        if (millis() - g_press.start_ms > MAX_PRESS_MS) {
+            // Not a rocker: a standing signal. End it so the panel does not freeze on one value (and so the rest
+            // of loop() runs again); a new press needs the input to go quiet first (g_idle_ok was reset).
+            g_stuck++;
+            screen_log("input stuck %.2f mV >%lus, ignored (%lu)", mv,
+                       (unsigned long)(MAX_PRESS_MS / 1000), (unsigned long)g_stuck);
+            press_end();
+            return;
+        }
         if (mv < PRESS_THRESHOLD_MV) {
             if (++g_press.below >= RELEASE_SAMPLES) press_end();
             return;
@@ -1906,6 +1924,7 @@ void loop()
         if (!ads_read_volts(MUX_DIFF_01, PGA_SIGNAL, &v)) {
             // keep the idle counter as it is; a failed read says nothing about the input
         } else if (v * 1000.0f < PRESS_THRESHOLD_MV) {
+            g_idle_mv = v * 1000.0f;
             if (g_idle_ok < IDLE_CONFIRM_SAMPLES) g_idle_ok++;
         } else if (now < BOOT_IGNORE_MS) {
             Serial.printf("[press] ignored during boot settle: %.2f mV\n", v * 1000.0f);
