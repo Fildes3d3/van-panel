@@ -8,7 +8,7 @@
  *   - Battery channels and the clean tank are steady while held; grey decays (dirty sender suspected).
  *   - The original gauge dial: ONE needle, two aligned linear scales - 8/10/12/14/16 V on top and
  *     0/(1/4)/(1/2)/(3/4)/(1/1) below. The calibrated line puts 0 mV at ~9.95 V, not 8 V, so the dial formula can
- *     never show an empty tank (floor 24 %); tanks have their own mapping - 4 steps, see TANK_EMPTY_MV.
+ *     never show an empty tank (floor 24 %); tanks have their own mapping from measured rod states - TANK_BANDS.
  *
  * Hardware (perfboard, van configuration):
  *   SIG+ --+-- 4.7k -- A0,  100 nF A0 -> board GND
@@ -197,17 +197,20 @@ static constexpr float VOLT_PER_MV     = (CAL_V_HI - CAL_V_LO) / (CAL_MV_HI - CA
 static constexpr float VOLT_OFFSET     = CAL_V_LO - CAL_MV_LO * VOLT_PER_MV;               // ~9.95 V at 0 mV
 
 // Tank level. The senders are 4 metal rods of different lengths (user, 2026-10-08): a common rod plus 3 level
-// rods, so a tank can only report 4 states, and the current through the water also varies with wetness, water
-// and supply. The panel therefore shows 4 steps - 0, 1/3, 2/3, full - not a fine percentage.
-// Both ends measured on the CLEAN tank, van power, CHARGER OFF (user decision), shared by both tanks (the board
-// cannot tell which is selected):
-//   empty (truly empty, 2026-10-08 19:16): 34.74 / 34.66 mV
-//   full  (settled ~15 min after filling, 19:51): 58.72 / 58.74 mV
-// The two middle steps sit at 1/3 and 2/3 of the way (user decision; the rod tip heights were not measured).
-// A reading snaps to the nearest step. With the charger ON the same empty tank read 47.3 mV, i.e. the 2/3 step.
-static constexpr float TANK_EMPTY_MV = 34.70f;
-static constexpr float TANK_FULL_MV  = 58.73f;
-static constexpr int   TANK_STEPS    = 3;        // intervals between the 4 states
+// rods, so a tank can only report a few states, and the current through the water also varies with wetness,
+// water and supply. The panel shows the state as a level, not a fine percentage. Both tanks share the table (the
+// board cannot tell which is selected). Values measured on the clean tank, charger off:
+//   empty            25-35 mV (truly empty 34.7; wet-empty grey 25-29)
+//   below full       43-45 mV, the level seen through the tank at ~3/4 (2026-10-09/10, van power and USB alike)
+//   full             55-62 mV (varies from day to day)
+// Spacing the states evenly in mV was wrong (it showed 33 % for a tank seen at 3/4), so the bands come from the
+// measured states. INTERIM: the 1/2 and 1/4 states have not been seen yet; until they are, a tank between them
+// shows 75 % or 0 %. With the charger ON readings run higher (empty read 47.3 mV).
+struct TankBand { float min_mv; float frac; };
+static const TankBand TANK_BANDS[] = {
+    {50.0f, 1.00f},      // full: midway between 45 (3/4) and 55 (lowest full)
+    {38.7f, 0.75f},      // 3/4: above the empty readings
+};                       // below the last band: empty
 
 // Gauge dial: one needle over two aligned linear scales
 static constexpr float DIAL_V_MIN      = 8.0f;    // left end: 8 V / empty
@@ -701,11 +704,13 @@ static void place_marker(lv_obj_t *mk, int bar_y, float frac)
 
 static void set_state_text(const char *text);
 
-// Tank fraction for a reading: 0, 1/3, 2/3 or 1 (nearest step between TANK_EMPTY_MV and TANK_FULL_MV).
+// Tank fraction for a reading, from the measured bands (see TANK_BANDS).
 static float tank_frac(float mv)
 {
-    float t = clampf((mv - TANK_EMPTY_MV) / (TANK_FULL_MV - TANK_EMPTY_MV), 0, 1);
-    return roundf(t * TANK_STEPS) / TANK_STEPS;
+    for (const TankBand &b : TANK_BANDS) {
+        if (mv >= b.min_mv) return b.frac;
+    }
+    return 0.0f;
 }
 
 static void show_value(float mv, bool live = false)
@@ -1036,7 +1041,7 @@ static void run_diagnostics()
     snprintf(line, sizeof(line),
              "Idle: A0 %s V   A1 %s V (signal- vs board GND)   A0-A1 %s mV   I2C/ADC errors: %lu%s\n"
              "Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   wire %s (%lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
-             "\nVolts %s: V = %.3f + %.5f x mV   tank: %d steps, empty %.1f mV, full %.1f mV",
+             "\nVolts %s: V = %.3f + %.5f x mV   tank: >=%.1f mV full, >=%.1f mV 3/4, else empty (interim)",
              s0, s1, sd, (unsigned long)g_read_errors, err_when, (unsigned long)(s / 3600),
              (unsigned long)((s / 60) % 60), (unsigned long)(s % 60), (unsigned long)g_press.n,
              (unsigned long)g_rejected, (unsigned long)g_stuck, g_wire_loose ? "OPEN" : "ok",
@@ -1044,7 +1049,7 @@ static void run_diagnostics()
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV,
-             TANK_STEPS + 1, TANK_EMPTY_MV, TANK_FULL_MV);
+             TANK_BANDS[0].min_mv, TANK_BANDS[1].min_mv);
     char sline[260];
     if (g_bl_change_ms) {
         uint32_t ago = (millis() - g_bl_change_ms) / 1000;
