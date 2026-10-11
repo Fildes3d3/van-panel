@@ -126,12 +126,23 @@ static constexpr uint16_t ADS_COMP_OFF    = 0x0003;       // COMP_QUE = 11
 static constexpr uint8_t MUX_DIFF_01 = 0x0;               // AIN0 - AIN1
 static constexpr uint8_t MUX_AIN0    = 0x4;               // AIN0 - GND
 static constexpr uint8_t MUX_AIN1    = 0x5;               // AIN1 - GND
+static constexpr uint8_t MUX_AIN2    = 0x6;               // AIN2 - GND (supply divider)
 
 struct Pga {
     uint16_t bits;
     float    lsb_v;
 };
 static constexpr Pga PGA_4V096  = {0x0200, 4.096f / 32768.0f};  // PGA = 001
+static constexpr Pga PGA_2V048  = {0x0400, 2.048f / 32768.0f};  // PGA = 010
+
+// Supply divider (2026-10-11): board VIN (the Toptron's fused +12 V) -- 47k -- A2 -- 4.7k -- board GND, no capacitor.
+// The Toptron's tank output follows its supply (empty tank +11.7 mV with the charger on, even with the board on an
+// isolated power bank), so the supply is measured to correct the tanks. 16 V -> 1.46 V at A2; a 40 V spike -> 3.6 V,
+// current held < 1 mA by the 47k. Resistors measured: 46.8 k and 4.71 k (in circuit: A2-GND 4.71 k, VIN-A2 47.5 k).
+static constexpr float SUPPLY_R_TOP_K = 46.8f;
+static constexpr float SUPPLY_R_BOT_K = 4.71f;
+static constexpr float SUPPLY_CAL     = 1.000f;   // set from a meter comparison at VIN
+static constexpr float SUPPLY_MIN_V   = 5.0f;     // below this there is no van feed (USB / power bank)
 static constexpr Pga PGA_1V024  = {0x0600, 1.024f / 32768.0f};  // PGA = 011
 static constexpr Pga PGA_0V256  = {0x0A00, 0.256f / 32768.0f};  // PGA = 101
 static constexpr Pga PGA_SIGNAL = PGA_0V256;                    // 100 ohm burden
@@ -399,6 +410,8 @@ static int        g_hist_count = 0;
 
 static int      g_idle_ok    = 0;                 // consecutive quiet readings (see IDLE_CONFIRM_SAMPLES)
 static float    g_idle_mv    = NAN;               // latest idle A0-A1 at the signal PGA (offset with nothing held)
+static float    g_supply_v   = NAN;               // smoothed supply (board VIN), NAN = no van feed
+static float    g_supply_raw = NAN;               // last single reading, for the diagnostics page
 static uint32_t g_stuck      = 0;                 // "presses" ended by MAX_PRESS_MS
 static bool     g_wire_loose = false;             // open-input detector state (see WIRE_LOOSE_MV)
 static uint32_t g_wire_events = 0;
@@ -985,8 +998,10 @@ static void press_end()
         float shown = end_mv;
         float volts = VOLT_OFFSET + VOLT_PER_MV * shown;
         float pct   = tank_frac(shown) * 100.0f;
-        vlog("PRESS #%lu %.1fs first %.2f @0.5s %s end %.2f peak %.2f mV -> %.2f V / %.0f %%",
-             (unsigned long)g_press.n, dur / 1000.0f, g_press.first_mv, a[1], end_mv, g_press.peak_mv, volts, pct);
+        vlog("PRESS #%lu %.1fs first %.2f @0.5s %s end %.2f peak %.2f mV -> %.2f V / %.0f %%, supply %.2f V",
+             (unsigned long)g_press.n, dur / 1000.0f, g_press.first_mv, a[1], end_mv, g_press.peak_mv, volts, pct,
+             g_supply_v);
+        vlog_flush();                             // a reading is worth keeping even if the power is cut next
     }
 
     for (int i = HISTORY_ROWS - 1; i > 0; i--) g_hist[i] = g_hist[i - 1];
@@ -1020,7 +1035,9 @@ static void run_diagnostics()
     float a0 = NAN, a1 = NAN;
     bool ok0 = ads_read_volts(MUX_AIN0, PGA_4V096, &a0);
     bool ok1 = ads_read_volts(MUX_AIN1, PGA_4V096, &a1);
-    char s0[16], s1[16], sd[16], line[440];
+    char s0[16], s1[16], sd[16], sup[40], line[500];
+    if (isnan(g_supply_v)) snprintf(sup, sizeof(sup), "-- (no van feed)");
+    else                   snprintf(sup, sizeof(sup), "%.2f V (now %.2f V)", g_supply_v, g_supply_raw);
     if (isnan(g_idle_mv)) snprintf(sd, sizeof(sd), "--");
     else                  snprintf(sd, sizeof(sd), "%.3f", g_idle_mv);
     if (ok0) snprintf(s0, sizeof(s0), "%.4f", a0); else snprintf(s0, sizeof(s0), "ERR");
@@ -1040,9 +1057,9 @@ static void run_diagnostics()
     }
     snprintf(line, sizeof(line),
              "Idle: A0 %s V   A1 %s V (signal- vs board GND)   A0-A1 %s mV   I2C/ADC errors: %lu%s\n"
-             "Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   wire %s (%lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
+             "Supply %s   Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   wire %s (%lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
              "\nVolts %s: V = %.3f + %.5f x mV   tank: >=%.1f mV full, >=%.1f mV 3/4, else empty (interim)",
-             s0, s1, sd, (unsigned long)g_read_errors, err_when, (unsigned long)(s / 3600),
+             s0, s1, sd, (unsigned long)g_read_errors, err_when, sup, (unsigned long)(s / 3600),
              (unsigned long)((s / 60) % 60), (unsigned long)(s % 60), (unsigned long)g_press.n,
              (unsigned long)g_rejected, (unsigned long)g_stuck, g_wire_loose ? "OPEN" : "ok",
              (unsigned long)g_wire_events,
@@ -1929,11 +1946,25 @@ static void log_sample()
     float a0 = NAN, a1 = NAN;
     ads_read_volts(MUX_AIN0, PGA_4V096, &a0);
     ads_read_volts(MUX_AIN1, PGA_4V096, &a1);
-    vlog("SAMPLE gnd A0 %.1f A1 %.1f mV, idle A0-A1 %.3f mV, i2c errors %lu, stuck %lu, heap %lu/%lu B, "
+    vlog("SAMPLE supply %.2f V, gnd A0 %.1f A1 %.1f mV, idle A0-A1 %.3f mV, i2c errors %lu, stuck %lu, heap %lu/%lu B, "
          "wifi %s %d dBm, screen %s",
-         a0 * 1000.0f, a1 * 1000.0f, g_idle_mv, (unsigned long)g_read_errors, (unsigned long)g_stuck,
+         g_supply_v, a0 * 1000.0f, a1 * 1000.0f, g_idle_mv, (unsigned long)g_read_errors, (unsigned long)g_stuck,
          (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned long)ESP.getFreeHeap(),
          g_ns.connected ? "on" : "off", g_ns.connected ? g_ns.rssi : 0, g_screen_off ? "dark" : "on");
+}
+
+// Once a second at rest. One conversion per call, smoothed, since the divider has no capacitor.
+static void supply_update()
+{
+    float v;
+    if (!ads_read_volts(MUX_AIN2, PGA_2V048, &v)) return;
+    float s = v * (SUPPLY_R_TOP_K + SUPPLY_R_BOT_K) / SUPPLY_R_BOT_K * SUPPLY_CAL;
+    g_supply_raw = s;
+    if (s < SUPPLY_MIN_V) {
+        g_supply_v = NAN;
+        return;
+    }
+    g_supply_v = isnan(g_supply_v) ? s : g_supply_v + 0.3f * (s - g_supply_v);
 }
 
 static void wire_check()
@@ -2087,6 +2118,11 @@ void loop()
             last_sample_ms = millis();
             if (last_sample_ms > BOOT_IGNORE_MS) log_sample();
             else last_sample_ms = 0;
+        }
+        static uint32_t last_supply_ms = 0;
+        if (millis() - last_supply_ms >= 1000) {
+            last_supply_ms = millis();
+            supply_update();
         }
         static uint32_t last_wire_ms = 0;
         if (millis() > BOOT_IGNORE_MS && millis() - last_wire_ms >= WIRE_CHECK_MS) {
