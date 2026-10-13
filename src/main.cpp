@@ -212,15 +212,15 @@ static constexpr float VOLT_PER_MV     = (CAL_V_HI - CAL_V_LO) / (CAL_MV_HI - CA
 static constexpr float VOLT_OFFSET     = CAL_V_LO - CAL_MV_LO * VOLT_PER_MV;               // ~9.95 V at 0 mV
 
 // Tank level. The senders are 4 metal rods of different lengths (user, 2026-10-08): a common rod plus 3 level
-// rods, so a tank can only report a few states, and the current through the water also varies with wetness,
-// water and supply. The panel shows the state as a level, not a fine percentage. Both tanks share the table (the
-// board cannot tell which is selected). Values measured on the clean tank, charger off:
-//   empty            25-35 mV (truly empty 34.7; wet-empty grey 25-29)
-//   below full       43-45 mV, the level seen through the tank at ~3/4 (2026-10-09/10, van power and USB alike)
-//   full             55-62 mV (varies from day to day)
-// Spacing the states evenly in mV was wrong (it showed 33 % for a tank seen at 3/4), so the bands come from the
-// measured states. INTERIM: the 1/2 and 1/4 states have not been seen yet; until they are, a tank between them
-// shows 75 % or 0 %. With the charger ON readings run higher (empty read 47.3 mV).
+// rods, so a tank can only report 4 states, and the current through the water also varies with wetness, water
+// and supply. The panel shows the state - 100 / 75 / 50 / 0 % - not a fine percentage. Both tanks share the
+// table (the board cannot tell which is selected). Calibrated on the CLEAN tank only: the grey sender has never
+// read reliably (user). Clean readings corrected to TANK_SUPPLY_REF_V, level seen through the tank wall:
+//   full (4 rods in water)  53-60 mV
+//   3/4  (3 rods)           44-45 mV   (2026-10-11/12)
+//   1/2  (2 rods)           34.3-34.8 mV (2026-10-13)
+//   empty / low (1 rod)     not yet read with the supply logged; the 29 mV edge is an estimate
+// Band edges sit midway between neighbouring states.
 // Supply correction (2026-10-11, van power, same levels, charger off/on): clean +8.4 mV for +0.63 V, grey +8.9 mV
 // for +0.70 V - the same ~12.8 mV per volt for both tanks, and the isolated power-bank run moved both by the same
 // 11.6/11.7 mV - so the supply ADDS a level-independent term. Readings are corrected to TANK_SUPPLY_REF_V with the
@@ -235,8 +235,9 @@ static inline float tank_corr_mv(float mv, float supply_v)
 
 struct TankBand { float min_mv; float frac; };
 static const TankBand TANK_BANDS[] = {
-    {50.0f, 1.00f},      // full: midway between 45 (3/4) and 55 (lowest full)
-    {38.7f, 0.75f},      // 3/4: above the empty readings
+    {50.0f, 1.00f},      // full
+    {39.5f, 0.75f},      // 3/4: midway between 1/2 (34.5) and 3/4 (44.5)
+    {29.0f, 0.50f},      // 1/2: lower edge estimated until the clean tank is read empty
 };                       // below the last band: empty
 
 // Gauge dial: one needle over two aligned linear scales
@@ -1090,7 +1091,7 @@ static void run_diagnostics()
     snprintf(line, sizeof(line),
              "Idle: A0 %s V   A1 %s V (signal- vs board GND)   A0-A1 %s mV   I2C/ADC errors: %lu%s\n"
              "Supply %s   Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   wire %s (%lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
-             "\nVolts %s: V = %.3f + %.5f x mV   tank (at %.1f V, -%.1f mV/V): >=%.1f mV full, >=%.1f mV 3/4, else empty",
+             "\nVolts %s: V = %.3f + %.5f x mV   tank (at %.1f V, -%.1f mV/V): >=%.1f full, >=%.1f 3/4, >=%.1f 1/2 mV",
              s0, s1, sd, (unsigned long)g_read_errors, err_when, sup, (unsigned long)(s / 3600),
              (unsigned long)((s / 60) % 60), (unsigned long)(s % 60), (unsigned long)g_press.n,
              (unsigned long)g_rejected, (unsigned long)g_stuck, g_wire_loose ? "OPEN" : "ok",
@@ -1098,7 +1099,8 @@ static void run_diagnostics()
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV,
-             TANK_SUPPLY_REF_V, TANK_SUPPLY_MV_PER_V, TANK_BANDS[0].min_mv, TANK_BANDS[1].min_mv);
+             TANK_SUPPLY_REF_V, TANK_SUPPLY_MV_PER_V, TANK_BANDS[0].min_mv, TANK_BANDS[1].min_mv,
+             TANK_BANDS[2].min_mv);
     char sline[260];
     if (g_bl_change_ms) {
         uint32_t ago = (millis() - g_bl_change_ms) / 1000;
