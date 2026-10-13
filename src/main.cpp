@@ -215,28 +215,21 @@ static constexpr float VOLT_OFFSET     = CAL_V_LO - CAL_MV_LO * VOLT_PER_MV;    
 // rods, so a tank can only report 4 states, and the current through the water also varies with wetness, water
 // and supply. The panel shows the state - 100 / 75 / 50 / 0 % - not a fine percentage. Both tanks share the
 // table (the board cannot tell which is selected). Calibrated on the CLEAN tank only: the grey sender has never
-// read reliably (user). Clean readings corrected to TANK_SUPPLY_REF_V, level seen through the tank wall:
-//   full (4 rods in water)  53-60 mV
-//   3/4  (3 rods)           44-45 mV   (2026-10-11/12)
-//   1/2  (2 rods)           34.3-34.8 mV (2026-10-13)
-//   empty / low (1 rod)     not yet read with the supply logged; the 29 mV edge is an estimate
+// read reliably (user). Clean readings with the charger OFF, level seen through the tank wall:
+//   full (4 rods in water)  55-59 mV   (2026-10-08 settled 58.7; power bank 56.8-58.9)
+//   3/4  (3 rods)           42.5-45 mV (2026-10-10/12)
+//   1/2  (2 rods)           35.5 mV    (2026-10-13, VIN 12.6-12.7 V)
+//   empty / low (1 rod)     not yet read; the 29 mV edge is an estimate
 // Band edges sit midway between neighbouring states.
-// Supply correction (2026-10-11, van power, same levels, charger off/on): clean +8.4 mV for +0.63 V, grey +8.9 mV
-// for +0.70 V - the same ~12.8 mV per volt for both tanks, and the isolated power-bank run moved both by the same
-// 11.6/11.7 mV - so the supply ADDS a level-independent term. Readings are corrected to TANK_SUPPLY_REF_V with the
-// supply measured during the press (the screen waking sags VIN by 0.2-0.3 V). Check: clean 43.6/43.9, grey
-// 34.1/34.0 mV after correction, charger off/on. No van feed (USB, power bank): uncorrected.
-static constexpr float TANK_SUPPLY_MV_PER_V = 12.8f;
-static constexpr float TANK_SUPPLY_REF_V    = 12.5f;
-static inline float tank_corr_mv(float mv, float supply_v)
-{
-    return isnan(supply_v) ? mv : mv - TANK_SUPPLY_MV_PER_V * (supply_v - TANK_SUPPLY_REF_V);
-}
-
+// No supply correction (user decision 2026-10-13): a voltage-proportional correction was tried and proved wrong -
+// with the charger on, the same 1/2 tank read 54.9 mV at both 13.28 and 13.67 V. The charger acts more like a fixed
+// offset per charger mode (+19.4 mV charging at 13.3-13.7 V, ~+8 mV in maintenance at 12.55 V), cause unknown.
+// The bands are for the CHARGER OFF; with the charger on, tanks read high (about one step). The supply is still
+// measured during each press and logged, as data for handling the charger later.
 struct TankBand { float min_mv; float frac; };
 static const TankBand TANK_BANDS[] = {
     {50.0f, 1.00f},      // full
-    {39.5f, 0.75f},      // 3/4: midway between 1/2 (34.5) and 3/4 (44.5)
+    {39.0f, 0.75f},      // 3/4: midway between 1/2 (35.5) and the lowest 3/4 (42.5)
     {29.0f, 0.50f},      // 1/2: lower edge estimated until the clean tank is read empty
 };                       // below the last band: empty
 
@@ -745,7 +738,7 @@ static float tank_frac(float mv)
     return 0.0f;
 }
 
-static void show_value(float mv, float supply_v, bool live = false)
+static void show_value(float mv, bool live = false)
 {
     float volts = VOLT_OFFSET + VOLT_PER_MV * mv;
     if (volts > PLAUSIBLE_MAX_V) {                // cannot be a real gauge reading - do not display it
@@ -757,7 +750,7 @@ static void show_value(float mv, float supply_v, bool live = false)
         return;
     }
     float frac  = (volts - DIAL_V_MIN) / (DIAL_V_MAX - DIAL_V_MIN);
-    float tfrac = tank_frac(tank_corr_mv(mv, supply_v));
+    float tfrac = tank_frac(mv);
     float pct   = tfrac * 100.0f;
     bool  red   = volts < RED_LOW_V || volts > RED_HIGH_V;
     char v[16], p[16];
@@ -995,7 +988,7 @@ static void press_sample(float mv)
     if (t >= WIN_START_MS && (!g_press.shown || millis() - g_press.live_ms >= LIVE_UI_MS)) {
         g_press.shown   = true;
         g_press.live_ms = millis();
-        show_value(mv, g_press.supply_v, true);
+        show_value(mv, true);
     }
     if (t < LOG_FAST_MS || t - g_press.last_log_ms >= LOG_SLOW_MS) {
         Serial.printf("[press] #%lu t=%5lu ms  %8.3f mV\n", (unsigned long)g_press.n, (unsigned long)t, mv);
@@ -1010,7 +1003,7 @@ static void press_end()
     // value ~0.2 s before release (the release edge itself is excluded); short presses: the last sample
     float end_mv = g_recent_count > END_BACK_SAMPLES ? g_recent[g_recent_head] : g_press.last_mv;
     if (dur >= MIN_PRESS_MS) {
-        show_value(end_mv, g_press.supply_v);     // the settled value stays on screen
+        show_value(end_mv);                       // the settled value stays on screen
     } else {
         Serial.printf("[press] #%lu ignored: %lu ms < %lu ms\n", (unsigned long)g_press.n, (unsigned long)dur,
                       (unsigned long)MIN_PRESS_MS);
@@ -1028,12 +1021,10 @@ static void press_end()
     {
         float shown = end_mv;
         float volts = VOLT_OFFSET + VOLT_PER_MV * shown;
-        float corr  = tank_corr_mv(shown, g_press.supply_v);
-        float pct   = tank_frac(corr) * 100.0f;
-        vlog("PRESS #%lu %.1fs first %.2f @0.5s %s end %.2f peak %.2f mV -> %.2f V / tank %.2f mV corr %.0f %%, "
-             "supply %.2f V",
-             (unsigned long)g_press.n, dur / 1000.0f, g_press.first_mv, a[1], end_mv, g_press.peak_mv, volts, corr,
-             pct, g_press.supply_v);
+        float pct   = tank_frac(shown) * 100.0f;
+        vlog("PRESS #%lu %.1fs first %.2f @0.5s %s end %.2f peak %.2f mV -> %.2f V / tank %.0f %%, supply %.2f V",
+             (unsigned long)g_press.n, dur / 1000.0f, g_press.first_mv, a[1], end_mv, g_press.peak_mv, volts, pct,
+             g_press.supply_v);
         vlog_flush();                             // a reading is worth keeping even if the power is cut next
     }
 
@@ -1091,7 +1082,7 @@ static void run_diagnostics()
     snprintf(line, sizeof(line),
              "Idle: A0 %s V   A1 %s V (signal- vs board GND)   A0-A1 %s mV   I2C/ADC errors: %lu%s\n"
              "Supply %s   Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   wire %s (%lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
-             "\nVolts %s: V = %.3f + %.5f x mV   tank (at %.1f V, -%.1f mV/V): >=%.1f full, >=%.1f 3/4, >=%.1f 1/2 mV",
+             "\nVolts %s: V = %.3f + %.5f x mV   tank (charger off): >=%.1f full, >=%.1f 3/4, >=%.1f 1/2 mV",
              s0, s1, sd, (unsigned long)g_read_errors, err_when, sup, (unsigned long)(s / 3600),
              (unsigned long)((s / 60) % 60), (unsigned long)(s % 60), (unsigned long)g_press.n,
              (unsigned long)g_rejected, (unsigned long)g_stuck, g_wire_loose ? "OPEN" : "ok",
@@ -1099,7 +1090,7 @@ static void run_diagnostics()
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV,
-             TANK_SUPPLY_REF_V, TANK_SUPPLY_MV_PER_V, TANK_BANDS[0].min_mv, TANK_BANDS[1].min_mv,
+             TANK_BANDS[0].min_mv, TANK_BANDS[1].min_mv,
              TANK_BANDS[2].min_mv);
     char sline[260];
     if (g_bl_change_ms) {
