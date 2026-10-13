@@ -143,6 +143,10 @@ static constexpr float SUPPLY_R_TOP_K = 46.8f;
 static constexpr float SUPPLY_R_BOT_K = 4.71f;
 static constexpr float SUPPLY_CAL     = 1.000f;   // set from a meter comparison at VIN
 static constexpr float SUPPLY_MIN_V   = 5.0f;     // below this there is no van feed (USB / power bank)
+static inline float supply_from_a2(float a2_volts)
+{
+    return a2_volts * (SUPPLY_R_TOP_K + SUPPLY_R_BOT_K) / SUPPLY_R_BOT_K * SUPPLY_CAL;
+}
 static constexpr Pga PGA_1V024  = {0x0600, 1.024f / 32768.0f};  // PGA = 011
 static constexpr Pga PGA_0V256  = {0x0A00, 0.256f / 32768.0f};  // PGA = 101
 static constexpr Pga PGA_SIGNAL = PGA_0V256;                    // 100 ohm burden
@@ -217,6 +221,18 @@ static constexpr float VOLT_OFFSET     = CAL_V_LO - CAL_MV_LO * VOLT_PER_MV;    
 // Spacing the states evenly in mV was wrong (it showed 33 % for a tank seen at 3/4), so the bands come from the
 // measured states. INTERIM: the 1/2 and 1/4 states have not been seen yet; until they are, a tank between them
 // shows 75 % or 0 %. With the charger ON readings run higher (empty read 47.3 mV).
+// Supply correction (2026-10-11, van power, same levels, charger off/on): clean +8.4 mV for +0.63 V, grey +8.9 mV
+// for +0.70 V - the same ~12.8 mV per volt for both tanks, and the isolated power-bank run moved both by the same
+// 11.6/11.7 mV - so the supply ADDS a level-independent term. Readings are corrected to TANK_SUPPLY_REF_V with the
+// supply measured during the press (the screen waking sags VIN by 0.2-0.3 V). Check: clean 43.6/43.9, grey
+// 34.1/34.0 mV after correction, charger off/on. No van feed (USB, power bank): uncorrected.
+static constexpr float TANK_SUPPLY_MV_PER_V = 12.8f;
+static constexpr float TANK_SUPPLY_REF_V    = 12.5f;
+static inline float tank_corr_mv(float mv, float supply_v)
+{
+    return isnan(supply_v) ? mv : mv - TANK_SUPPLY_MV_PER_V * (supply_v - TANK_SUPPLY_REF_V);
+}
+
 struct TankBand { float min_mv; float frac; };
 static const TankBand TANK_BANDS[] = {
     {50.0f, 1.00f},      // full: midway between 45 (3/4) and 55 (lowest full)
@@ -391,6 +407,8 @@ struct Press {
     int      below       = 0;
     bool     active      = false;
     float    win_mv      = NAN;    // max |mV| inside the capture window
+    float    supply_v    = NAN;    // supply measured during the press (NAN = no van feed)
+    uint32_t supply_ms   = 0;      // millis() of the last supply read during the press
     bool     shown       = false;  // a value has been published for this press
     uint32_t live_ms     = 0;      // millis() of the last live update
 };
@@ -726,7 +744,7 @@ static float tank_frac(float mv)
     return 0.0f;
 }
 
-static void show_value(float mv, bool live = false)
+static void show_value(float mv, float supply_v, bool live = false)
 {
     float volts = VOLT_OFFSET + VOLT_PER_MV * mv;
     if (volts > PLAUSIBLE_MAX_V) {                // cannot be a real gauge reading - do not display it
@@ -738,7 +756,7 @@ static void show_value(float mv, bool live = false)
         return;
     }
     float frac  = (volts - DIAL_V_MIN) / (DIAL_V_MAX - DIAL_V_MIN);
-    float tfrac = tank_frac(mv);
+    float tfrac = tank_frac(tank_corr_mv(mv, supply_v));
     float pct   = tfrac * 100.0f;
     bool  red   = volts < RED_LOW_V || volts > RED_HIGH_V;
     char v[16], p[16];
@@ -934,6 +952,8 @@ static void press_start(float mv)
     g_press.below       = 0;
     g_press.last_log_ms = 0;
     g_press.win_mv      = NAN;
+    g_press.supply_v    = g_supply_v;             // until the first read during the press
+    g_press.supply_ms   = 0;
     g_press.shown       = false;
     for (float &v : g_press.at_mv) v = NAN;
     g_recent_count = 0;
@@ -961,10 +981,20 @@ static void press_sample(float mv)
     if (t >= WIN_START_MS && t <= WIN_END_MS && (isnan(g_press.win_mv) || fabsf(mv) > fabsf(g_press.win_mv))) {
         g_press.win_mv = mv;
     }
+    if (!g_press.supply_ms || millis() - g_press.supply_ms >= 100) {   // the supply, every 0.1 s while held
+        g_press.supply_ms = millis();
+        float a2;
+        if (ads_read_volts(MUX_AIN2, PGA_2V048, &a2)) {
+            float sv = supply_from_a2(a2);
+            if (sv < SUPPLY_MIN_V)         g_press.supply_v = NAN;
+            else if (isnan(g_press.supply_v)) g_press.supply_v = sv;
+            else                           g_press.supply_v += 0.5f * (sv - g_press.supply_v);
+        }
+    }
     if (t >= WIN_START_MS && (!g_press.shown || millis() - g_press.live_ms >= LIVE_UI_MS)) {
         g_press.shown   = true;
         g_press.live_ms = millis();
-        show_value(mv, true);
+        show_value(mv, g_press.supply_v, true);
     }
     if (t < LOG_FAST_MS || t - g_press.last_log_ms >= LOG_SLOW_MS) {
         Serial.printf("[press] #%lu t=%5lu ms  %8.3f mV\n", (unsigned long)g_press.n, (unsigned long)t, mv);
@@ -979,7 +1009,7 @@ static void press_end()
     // value ~0.2 s before release (the release edge itself is excluded); short presses: the last sample
     float end_mv = g_recent_count > END_BACK_SAMPLES ? g_recent[g_recent_head] : g_press.last_mv;
     if (dur >= MIN_PRESS_MS) {
-        show_value(end_mv);                       // the settled value stays on screen
+        show_value(end_mv, g_press.supply_v);     // the settled value stays on screen
     } else {
         Serial.printf("[press] #%lu ignored: %lu ms < %lu ms\n", (unsigned long)g_press.n, (unsigned long)dur,
                       (unsigned long)MIN_PRESS_MS);
@@ -997,10 +1027,12 @@ static void press_end()
     {
         float shown = end_mv;
         float volts = VOLT_OFFSET + VOLT_PER_MV * shown;
-        float pct   = tank_frac(shown) * 100.0f;
-        vlog("PRESS #%lu %.1fs first %.2f @0.5s %s end %.2f peak %.2f mV -> %.2f V / %.0f %%, supply %.2f V",
-             (unsigned long)g_press.n, dur / 1000.0f, g_press.first_mv, a[1], end_mv, g_press.peak_mv, volts, pct,
-             g_supply_v);
+        float corr  = tank_corr_mv(shown, g_press.supply_v);
+        float pct   = tank_frac(corr) * 100.0f;
+        vlog("PRESS #%lu %.1fs first %.2f @0.5s %s end %.2f peak %.2f mV -> %.2f V / tank %.2f mV corr %.0f %%, "
+             "supply %.2f V",
+             (unsigned long)g_press.n, dur / 1000.0f, g_press.first_mv, a[1], end_mv, g_press.peak_mv, volts, corr,
+             pct, g_press.supply_v);
         vlog_flush();                             // a reading is worth keeping even if the power is cut next
     }
 
@@ -1058,7 +1090,7 @@ static void run_diagnostics()
     snprintf(line, sizeof(line),
              "Idle: A0 %s V   A1 %s V (signal- vs board GND)   A0-A1 %s mV   I2C/ADC errors: %lu%s\n"
              "Supply %s   Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   wire %s (%lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
-             "\nVolts %s: V = %.3f + %.5f x mV   tank: >=%.1f mV full, >=%.1f mV 3/4, else empty (interim)",
+             "\nVolts %s: V = %.3f + %.5f x mV   tank (at %.1f V, -%.1f mV/V): >=%.1f mV full, >=%.1f mV 3/4, else empty",
              s0, s1, sd, (unsigned long)g_read_errors, err_when, sup, (unsigned long)(s / 3600),
              (unsigned long)((s / 60) % 60), (unsigned long)(s % 60), (unsigned long)g_press.n,
              (unsigned long)g_rejected, (unsigned long)g_stuck, g_wire_loose ? "OPEN" : "ok",
@@ -1066,7 +1098,7 @@ static void run_diagnostics()
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV,
-             TANK_BANDS[0].min_mv, TANK_BANDS[1].min_mv);
+             TANK_SUPPLY_REF_V, TANK_SUPPLY_MV_PER_V, TANK_BANDS[0].min_mv, TANK_BANDS[1].min_mv);
     char sline[260];
     if (g_bl_change_ms) {
         uint32_t ago = (millis() - g_bl_change_ms) / 1000;
@@ -1958,7 +1990,7 @@ static void supply_update()
 {
     float v;
     if (!ads_read_volts(MUX_AIN2, PGA_2V048, &v)) return;
-    float s = v * (SUPPLY_R_TOP_K + SUPPLY_R_BOT_K) / SUPPLY_R_BOT_K * SUPPLY_CAL;
+    float s = supply_from_a2(v);
     g_supply_raw = s;
     if (s < SUPPLY_MIN_V) {
         g_supply_v = NAN;
