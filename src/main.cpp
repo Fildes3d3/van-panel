@@ -199,17 +199,18 @@ static constexpr uint32_t BL_TEST_MS       = 5000;
 static constexpr uint32_t BL_REASSERT_MS    = 5000;   // while blanked, re-assert "off" in case a glitch flips it
 static constexpr uint32_t ERROR_FRESH_MS = 5UL * 60UL * 1000UL;  // status dot shows recent errors, not a latch
 
-// Volts calibration, 100 ohm burden: V = VOLT_OFFSET + VOLT_PER_MV * mV. Two-point, leisure battery, 2026-09-29,
-// battery voltage read at the terminals while the rocker was held; mV = the Diag "@0.5s" value:
-//   charger off: 12.55 V <-> 51.17 mV (press #2)
-//   charger on : 14.07 V <-> 81.05 mV (presses #6/#7: 80.99, 81.10)
-// Only verified between 12.55 and 14.07 V; below and above that it is an extrapolation of a straight line.
-// The same line is used for the car battery and, through the dial formula, for the tanks (one needle, one gauge).
-static constexpr float CAL_MV_LO = 51.17f, CAL_V_LO = 12.55f;
-static constexpr float CAL_MV_HI = 81.05f, CAL_V_HI = 14.07f;
+// Volts calibration, 100 ohm burden: V = VOLT_OFFSET + VOLT_PER_MV * mV. Least-squares line through three points
+// on the leisure battery, van power, battery voltage read at the terminals while the rocker was held:
+//   12.55 V <-> 51.17 mV  charger off            (2026-09-29)
+//   14.07 V <-> 81.05 mV  charger on             (2026-09-29, presses 80.99 / 81.10)
+//   12.10 V <-> 44.84 mV  charger off, low point (2026-10-22, presses 44.77 / 44.85; meter read to one decimal)
+// Residuals +0.06 / -0.01 / -0.05 V. The old two-point line (9.947 + 0.05087 mV) read 0.13 V high at 12.1 V.
+// A two-segment fit would hit all three exactly, but its low slope swings +-10 % with the 12.1 V reading's last
+// digit, so one straight line is the more honest choice. Outside 12.1-14.1 V it is an extrapolation.
+// The same line is used for the car battery (one needle, one gauge).
 static constexpr bool  VOLT_CALIBRATED = true;
-static constexpr float VOLT_PER_MV     = (CAL_V_HI - CAL_V_LO) / (CAL_MV_HI - CAL_MV_LO);   // ~0.05088 V/mV
-static constexpr float VOLT_OFFSET     = CAL_V_LO - CAL_MV_LO * VOLT_PER_MV;               // ~9.95 V at 0 mV
+static constexpr float VOLT_PER_MV     = 0.05330f;    // V per mV
+static constexpr float VOLT_OFFSET     = 9.761f;      // V at 0 mV
 
 // Tank level. The senders are 4 metal rods of different lengths (user, 2026-10-08): a common rod plus 3 level
 // rods, so a tank can only report 4 states, and the current through the water also varies with wetness, water
