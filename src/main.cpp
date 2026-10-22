@@ -1971,9 +1971,11 @@ static void log_sample()
     float a0 = NAN, a1 = NAN;
     ads_read_volts(MUX_AIN0, PGA_4V096, &a0);
     ads_read_volts(MUX_AIN1, PGA_4V096, &a1);
-    vlog("SAMPLE supply %.2f V, gnd A0 %.1f A1 %.1f mV, idle A0-A1 %.3f mV, i2c errors %lu, stuck %lu, heap %lu/%lu B, "
-         "wifi %s %d dBm, screen %s",
-         g_supply_v, a0 * 1000.0f, a1 * 1000.0f, g_idle_mv, (unsigned long)g_read_errors, (unsigned long)g_stuck,
+    // chip temperature: not the cabin's, but it follows it - to see whether the open-A0 fault (2026-10) comes and
+    // goes with warming and cooling (a cracked joint) rather than with use
+    vlog("SAMPLE supply %.2f V, chip %.1f C, gnd A0 %.1f A1 %.1f mV, idle A0-A1 %.3f mV, i2c errors %lu, stuck %lu, "
+         "heap %lu/%lu B, wifi %s %d dBm, screen %s",
+         g_supply_v, temperatureRead(), a0 * 1000.0f, a1 * 1000.0f, g_idle_mv, (unsigned long)g_read_errors, (unsigned long)g_stuck,
          (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned long)ESP.getFreeHeap(),
          g_ns.connected ? "on" : "off", g_ns.connected ? g_ns.rssi : 0, g_screen_off ? "dark" : "on");
 }
@@ -2008,8 +2010,8 @@ static void wire_check()
         since_ms = millis();
         max_mv = d;
         good = 0;
-        vlog("WIRE signal input looks OPEN: A0 %.0f mV, A1 %.0f mV vs board GND (apart %.0f mV) - presses ignored",
-             a0 * 1000.0f, a1 * 1000.0f, d);
+        vlog("WIRE signal input looks OPEN: A0 %.0f mV, A1 %.0f mV vs board GND (apart %.0f mV), chip %.1f C - "
+             "presses ignored", a0 * 1000.0f, a1 * 1000.0f, d, temperatureRead());
         set_state_text("Signal wire loose? Rockers ignored");
         return;
     }
@@ -2021,8 +2023,8 @@ static void wire_check()
     }
     g_wire_loose = false;
     bad = 0;
-    vlog("WIRE signal input connected again after %lu s (A0/A1 were up to %.0f mV apart)",
-         (unsigned long)((millis() - since_ms) / 1000), max_mv);
+    vlog("WIRE signal input connected again after %lu s (A0/A1 were up to %.0f mV apart), chip %.1f C",
+         (unsigned long)((millis() - since_ms) / 1000), max_mv, temperatureRead());
     set_state_text(g_display_ms ? "Held reading" : "Hold a selector on the panel");
 }
 
