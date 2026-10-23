@@ -67,6 +67,7 @@
 #include "lvgl_v8_port.h"
 #include "net.h"
 #include "vlog.h"
+#include "hist.h"
 #include <Preferences.h>
 #include <esp_system.h>
 #include <esp_core_dump.h>
@@ -77,6 +78,7 @@ using namespace esp_panel::board;
 
 LV_FONT_DECLARE(font_num_88);
 LV_FONT_DECLARE(font_num_56);
+LV_FONT_DECLARE(font_text_18);
 LV_FONT_DECLARE(font_clock_44);
 LV_FONT_DECLARE(font_clock_170);
 LV_FONT_DECLARE(font_icon_44);
@@ -372,6 +374,7 @@ static lv_obj_t *wx_content   = nullptr;
 
 // page 3 (big clock)
 static lv_obj_t *lbl_big_clock = nullptr;
+static lv_obj_t *lbl_hist_clock = nullptr;           // history page header clock
 static lv_obj_t *lbl_big_date  = nullptr;
 
 // settings
@@ -715,6 +718,8 @@ static void rtc_from_system_time(const char *why)
 
 static void on_ntp_synced() { g_ntp_synced = true; }   // runs in the network task: just flag it
 
+static void update_frost();
+
 static void update_clocks()
 {
     char hm[8], date[40];
@@ -731,6 +736,8 @@ static void update_clocks()
     lvgl_port_lock(-1);
     lv_label_set_text(lbl_clock, hm);
     lv_label_set_text(lbl_wx_clock, hm);
+    if (lbl_hist_clock) lv_label_set_text(lbl_hist_clock, hm);
+    update_frost();
     lv_label_set_text(lbl_big_clock, hm);
     lv_label_set_text(lbl_big_date, date);
     lvgl_port_unlock();
@@ -797,18 +804,211 @@ static void make_hatch()
     g_hatch_img.data      = (const uint8_t *)g_hatch_px;
 }
 
-static void duo_set_fill(lv_obj_t *fill, float frac, lv_color_t color, bool striped)
+// Box geometry: with the frost banner shown the boxes start lower (22 px under the banner), same bottom edge.
+static constexpr int DUO_Y_BANNER = 114;
+// Children of a box are placed inside its border (LVGL 8 content area), so all fill/wave maths use the inner
+// height. Using the outer height put the wave 12 px (2 x border) too low - it covered the top of the stripes.
+static constexpr int DUO_BORDER   = 6;
+static int        g_duo_y      = DUO_Y;
+static int        g_duo_h      = DUO_H;
+static lv_obj_t  *duo_bat_box  = nullptr;
+static lv_obj_t  *duo_wat_box  = nullptr;
+static lv_obj_t  *duo_wave     = nullptr;
+static lv_obj_t  *duo_bolt     = nullptr;
+static bool       g_duo_live   = false;        // battery side shows the live leisure value, not a press
+
+struct DuoFillState { float frac; lv_color_t color; bool striped; bool shown; };
+static DuoFillState g_bat_fs = {}, g_wat_fs = {};
+static DuoFillState &fill_state(lv_obj_t *fill) { return fill == duo_wat_fill ? g_wat_fs : g_bat_fs; }
+
+// Water surface: a strip one wave period wider than the box, drifting left by one period and repeating. The strip
+// is periodic, so the restart is invisible (the first mockup's strip was too short and showed its end).
+static constexpr int WAVE_PERIOD = 104;
+static constexpr int WAVE_H      = 14;
+static lv_img_dsc_t  g_wave_img;
+static uint8_t      *g_wave_px = nullptr;
+static void make_wave()
 {
-    int h = (int)(clampf(frac, 0, 1) * DUO_H + 0.5f);
-    if (h <= 0) {
-        lv_obj_add_flag(fill, LV_OBJ_FLAG_HIDDEN);
+    const int w = DUO_W + WAVE_PERIOD;
+    g_wave_px = (uint8_t *)heap_caps_malloc(w * WAVE_H * 3, MALLOC_CAP_SPIRAM);
+    if (!g_wave_px) return;
+    lv_color_t c = DUO_BLUE;
+    for (int x = 0; x < w; x++) {
+        float top = 7.0f - 4.5f * sinf(2.0f * (float)M_PI * x / WAVE_PERIOD);   // 2.5 .. 11.5 px down the strip
+        for (int y = 0; y < WAVE_H; y++) {
+            uint8_t *px = g_wave_px + (y * w + x) * 3;          // TRUE_COLOR_ALPHA, 16-bit: colour lo, hi, alpha
+            px[0] = c.full & 0xFF;
+            px[1] = c.full >> 8;
+            px[2] = (uint8_t)(clampf((y + 1.0f) - top, 0, 1) * 255.0f);   // 1 px soft edge
+        }
+    }
+    g_wave_img.header.always_zero = 0;
+    g_wave_img.header.w  = w;
+    g_wave_img.header.h  = WAVE_H;
+    g_wave_img.header.cf = LV_IMG_CF_TRUE_COLOR_ALPHA;
+    g_wave_img.data_size = w * WAVE_H * 3;
+    g_wave_img.data      = g_wave_px;
+}
+
+static int duo_inner_h() { return g_duo_h - 2 * DUO_BORDER; }
+
+// The strip sits ON the fill: its bottom edge meets the fill's top, so on the striped "<=50 %" fill the stripes run
+// all the way up and the wave starts where they end.
+static void wave_place(int fill_h)
+{
+    if (duo_wave) lv_obj_set_y(duo_wave, duo_inner_h() - fill_h - WAVE_H);
+}
+
+static void wave_drift_cb(void *obj, int32_t v) { lv_obj_set_x((lv_obj_t *)obj, v); }
+
+static void wave_run(bool on)
+{
+    if (!duo_wave || !g_wave_px) return;
+    if (!on) {
+        lv_anim_del(duo_wave, wave_drift_cb);
+        lv_obj_add_flag(duo_wave, LV_OBJ_FLAG_HIDDEN);
         return;
     }
-    lv_obj_set_height(fill, h);
-    lv_obj_align(fill, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_clear_flag(duo_wave, LV_OBJ_FLAG_HIDDEN);
+    if (lv_anim_get(duo_wave, wave_drift_cb)) return;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, duo_wave);
+    lv_anim_set_exec_cb(&a, wave_drift_cb);
+    lv_anim_set_values(&a, 0, -WAVE_PERIOD);
+    lv_anim_set_time(&a, 3200);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);
+    lv_anim_start(&a);
+}
+
+// Fills rise (or fall) to the new level instead of jumping.
+static void fill_height_cb(void *obj, int32_t h)
+{
+    lv_obj_t *f = (lv_obj_t *)obj;
+    lv_obj_set_height(f, h);
+    lv_obj_align(f, LV_ALIGN_BOTTOM_MID, 0, 0);
+    if (f == duo_wat_fill) wave_place(h);
+}
+
+static void duo_set_fill(lv_obj_t *fill, float frac, lv_color_t color, bool striped)
+{
+    DuoFillState &fs = fill_state(fill);
+    fs = {frac, color, striped, true};
+    int h = (int)(clampf(frac, 0, 1) * duo_inner_h() + 0.5f);
+    lv_anim_del(fill, fill_height_cb);
+    if (h <= 0) {
+        fs.shown = false;
+        lv_obj_add_flag(fill, LV_OBJ_FLAG_HIDDEN);
+        if (fill == duo_wat_fill) wave_run(false);
+        return;
+    }
+    int from = lv_obj_has_flag(fill, LV_OBJ_FLAG_HIDDEN) ? 0 : lv_obj_get_height(fill);
     lv_obj_set_style_bg_color(fill, color, 0);
     lv_obj_set_style_bg_img_src(fill, striped ? &g_hatch_img : nullptr, 0);
+    fill_height_cb(fill, from);
     lv_obj_clear_flag(fill, LV_OBJ_FLAG_HIDDEN);
+    if (fill == duo_wat_fill) wave_run(true);
+    if (from == h) return;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, fill);
+    lv_anim_set_exec_cb(&a, fill_height_cb);
+    lv_anim_set_values(&a, from, h);
+    lv_anim_set_time(&a, 700);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
+static void duo_hide_fill(lv_obj_t *fill)
+{
+    fill_state(fill).shown = false;
+    lv_anim_del(fill, fill_height_cb);
+    lv_obj_add_flag(fill, LV_OBJ_FLAG_HIDDEN);
+    if (fill == duo_wat_fill) wave_run(false);
+}
+
+// Slow pulse of the battery fill while charging.
+static void pulse_cb(void *obj, int32_t v) { lv_obj_set_style_bg_opa((lv_obj_t *)obj, (lv_opa_t)v, 0); }
+static void bat_pulse(bool on)
+{
+    if (!on) {
+        lv_anim_del(duo_bat_fill, pulse_cb);
+        lv_obj_set_style_bg_opa(duo_bat_fill, LV_OPA_COVER, 0);
+        return;
+    }
+    if (lv_anim_get(duo_bat_fill, pulse_cb)) return;
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, duo_bat_fill);
+    lv_anim_set_exec_cb(&a, pulse_cb);
+    lv_anim_set_values(&a, LV_OPA_COVER, 158);
+    lv_anim_set_time(&a, 1000);
+    lv_anim_set_playback_time(&a, 1000);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_start(&a);
+}
+
+// Frost banner on/off moves the boxes; re-apply the current fills to the new height.
+static void duo_layout(bool banner)
+{
+    int y = banner ? DUO_Y_BANNER : DUO_Y;
+    if (y == g_duo_y || !duo_bat_box) return;
+    g_duo_y = y;
+    g_duo_h = DUO_Y + DUO_H - y;
+    lv_obj_t *boxes[2] = {duo_bat_box, duo_wat_box};
+    for (lv_obj_t *b : boxes) {
+        lv_obj_set_y(b, g_duo_y);
+        lv_obj_set_height(b, g_duo_h);
+    }
+    lv_obj_center(duo_bolt);
+    lv_obj_t *fills[2] = {duo_bat_fill, duo_wat_fill};
+    for (lv_obj_t *f : fills) {
+        DuoFillState fs = fill_state(f);
+        if (fs.shown) {
+            lv_anim_del(f, fill_height_cb);
+            fill_height_cb(f, (int)(clampf(fs.frac, 0, 1) * duo_inner_h() + 0.5f));
+        }
+    }
+}
+
+// Live leisure battery (no rocker needed): the A2 divider reads the Toptron's feed, i.e. the leisure battery minus
+// the feed's drop. Offsets: screen lit 0.40 V (2026-10-22: 12.1 V at the terminals, VIN 11.70 V during a press);
+// screen dark 0.15 V is an ESTIMATE (VIN rises 0.2-0.3 V when the backlight goes off) - calibrate with a meter.
+// Only with a van feed: on USB or a power bank there is no supply reading and the battery side shows "-- V".
+static constexpr float LIVE_OFFSET_LIT_V  = 0.40f;
+static constexpr float LIVE_OFFSET_DARK_V = 0.15f;
+static constexpr float CHARGING_V         = 13.0f;    // above any resting lead-acid voltage
+static float live_battery_v()
+{
+    if (isnan(g_supply_v)) return NAN;
+    return g_supply_v + (g_screen_off ? LIVE_OFFSET_DARK_V : LIVE_OFFSET_LIT_V);
+}
+
+static void duo_show_live()                      // caller holds the LVGL lock
+{
+    float v = live_battery_v();
+    if (isnan(v) || g_theme_idx != 1) {
+        duo_hide_fill(duo_bat_fill);
+        bat_pulse(false);
+        lv_obj_add_flag(duo_bolt, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(duo_lbl_volt, "-- V");
+        lv_obj_set_style_text_color(duo_lbl_volt, COL_DIM, 0);
+        g_duo_live = false;
+        return;
+    }
+    float bf = battery_fill(v);
+    duo_set_fill(duo_bat_fill, bf, bf < 0.25f ? DUO_RED : (bf < 0.5f ? DUO_YELLOW : DUO_GREEN), false);
+    char t[16];
+    snprintf(t, sizeof(t), "%.1f V", v);
+    lv_label_set_text(duo_lbl_volt, t);
+    lv_obj_set_style_text_color(duo_lbl_volt, COL_TEXT, 0);
+    bool charging = v >= CHARGING_V;
+    bat_pulse(charging);
+    if (charging) lv_obj_clear_flag(duo_bolt, LV_OBJ_FLAG_HIDDEN);
+    else          lv_obj_add_flag(duo_bolt, LV_OBJ_FLAG_HIDDEN);
+    g_duo_live = true;
 }
 
 static void apply_theme()
@@ -817,7 +1017,9 @@ static void apply_theme()
     if (g_theme_idx == 1) {
         lv_obj_add_flag(cont_classic, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(cont_duo, LV_OBJ_FLAG_HIDDEN);
+        if (!g_display_ms) duo_show_live();
     } else {
+        if (duo_bolt) duo_show_live();            // theme is Classic: this stops the pulse and clears the side
         lv_obj_add_flag(cont_duo, LV_OBJ_FLAG_HIDDEN);
         lv_obj_clear_flag(cont_classic, LV_OBJ_FLAG_HIDDEN);
     }
@@ -850,11 +1052,14 @@ static void show_value(float mv, bool live = false)
     lv_obj_set_style_text_color(lbl_pct, COL_TEXT, 0);
     place_marker(mk_bat, BAT_BAR_Y, frac);
     place_marker(mk_wat, WAT_BAR_Y, tfrac);
-    {
+    if (g_theme_idx == 1) {                       // Duo only: no animations running on a hidden layer
         float bf = battery_fill(volts);
         lv_color_t bc = bf < 0.25f ? DUO_RED : (bf < 0.5f ? DUO_YELLOW : DUO_GREEN);
         duo_set_fill(duo_bat_fill, bf, bc, false);
         duo_set_fill(duo_wat_fill, tfrac, DUO_BLUE, tank_is_low(mv));
+        bat_pulse(false);                         // a press shows the pressed channel, not the live battery
+        lv_obj_add_flag(duo_bolt, LV_OBJ_FLAG_HIDDEN);
+        g_duo_live = false;
         lv_label_set_text(duo_lbl_volt, v);
         lv_label_set_text(duo_lbl_pct, p);
         lv_obj_set_style_text_color(duo_lbl_volt, COL_TEXT, 0);
@@ -876,12 +1081,10 @@ static void clear_value()
     lv_obj_set_style_text_color(lbl_pct, COL_DIM, 0);
     lv_obj_add_flag(mk_bat, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(mk_wat, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(duo_bat_fill, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(duo_wat_fill, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(duo_lbl_volt, "-- V");
+    duo_hide_fill(duo_wat_fill);
     lv_label_set_text(duo_lbl_pct, "-- %");
-    lv_obj_set_style_text_color(duo_lbl_volt, COL_DIM, 0);
     lv_obj_set_style_text_color(duo_lbl_pct, COL_DIM, 0);
+    duo_show_live();                              // battery side falls back to the live leisure value
     lv_label_set_text(lbl_state, "Hold a selector on the panel");
     lvgl_port_unlock();
     g_display_ms = 0;
@@ -1435,8 +1638,8 @@ static void wx_refresh_cb(lv_event_t *e)
 
 static void page_dots(lv_obj_t *tile, int active)
 {
-    for (int i = 0; i < 3; i++) {
-        lv_obj_t *d = make_rect(tile, 400 - 26 + i * 20, 462, 10, 10, i == active ? COL_TEXT : lv_color_hex(0x3A4750));
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *d = make_rect(tile, 400 - 35 + i * 20, 462, 10, 10, i == active ? COL_TEXT : lv_color_hex(0x3A4750));
         lv_obj_set_style_radius(d, LV_RADIUS_CIRCLE, 0);
     }
 }
@@ -1521,12 +1724,12 @@ static lv_obj_t *duo_box(lv_obj_t *parent, int x, lv_obj_t **fill)
 {
     lv_obj_t *box = lv_obj_create(parent);
     lv_obj_remove_style_all(box);
-    lv_obj_set_pos(box, x, DUO_Y);
-    lv_obj_set_size(box, DUO_W, DUO_H);
+    lv_obj_set_pos(box, x, g_duo_y);
+    lv_obj_set_size(box, DUO_W, g_duo_h);
     lv_obj_set_style_radius(box, 16, 0);
     lv_obj_set_style_clip_corner(box, true, 0);
     lv_obj_set_style_border_color(box, lv_color_white(), 0);
-    lv_obj_set_style_border_width(box, 6, 0);
+    lv_obj_set_style_border_width(box, DUO_BORDER, 0);
     lv_obj_set_style_border_post(box, true, 0);      // outline drawn over the fill
     lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     *fill = lv_obj_create(box);
@@ -1556,10 +1759,257 @@ static void build_duo_layer(lv_obj_t *p)
     lv_obj_remove_style_all(cont_duo);
     lv_obj_set_size(cont_duo, 800, 480);
     lv_obj_clear_flag(cont_duo, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    duo_box(cont_duo, DUO_BAT_X, &duo_bat_fill);
-    duo_box(cont_duo, DUO_WAT_X, &duo_wat_fill);
+    duo_bat_box = duo_box(cont_duo, DUO_BAT_X, &duo_bat_fill);
+    duo_wat_box = duo_box(cont_duo, DUO_WAT_X, &duo_wat_fill);
+    make_wave();
+    if (g_wave_px) {
+        duo_wave = lv_img_create(duo_wat_box);    // above the water fill, under the outline (border_post)
+        lv_img_set_src(duo_wave, &g_wave_img);
+        lv_obj_clear_flag(duo_wave, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(duo_wave, LV_OBJ_FLAG_HIDDEN);
+    }
+    duo_bolt = make_label(duo_bat_box, &lv_font_montserrat_48, lv_color_white());
+    lv_label_set_text(duo_bolt, LV_SYMBOL_CHARGE);
+    lv_obj_center(duo_bolt);
+    lv_obj_add_flag(duo_bolt, LV_OBJ_FLAG_HIDDEN);
     duo_lbl_volt = duo_value(cont_duo, DUO_BAT_X + DUO_W / 2, "-- V");
     duo_lbl_pct  = duo_value(cont_duo, DUO_WAT_X + DUO_W / 2, "-- %");
+}
+
+// ---------- frost warning ------------------------------------------------------
+// From open-meteo's daily minimum: the coming night is tomorrow's minimum (it falls around dawn); between midnight
+// and 06:00 it is today's. At or below FROST_C the gauge page shows the banner; Duo's boxes move down to make room.
+static constexpr float FROST_C = 0.0f;
+static lv_obj_t *banner_frost = nullptr;
+static lv_obj_t *lbl_frost    = nullptr;
+static bool      g_frost      = false;
+
+static void build_frost_banner(lv_obj_t *p)
+{
+    banner_frost = lv_obj_create(p);
+    lv_obj_remove_style_all(banner_frost);
+    lv_obj_set_pos(banner_frost, 160, 62);
+    lv_obj_set_size(banner_frost, 480, 30);
+    lv_obj_set_style_radius(banner_frost, 15, 0);
+    lv_obj_set_style_bg_color(banner_frost, lv_color_hex(0x123A5C), 0);
+    lv_obj_set_style_bg_opa(banner_frost, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(banner_frost, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(banner_frost, LV_OBJ_FLAG_HIDDEN);
+    lbl_frost = make_label(banner_frost, &font_text_18, lv_color_hex(0xCFE8FF));
+    lv_label_set_text(lbl_frost, "");
+    lv_obj_center(lbl_frost);
+}
+
+static void update_frost()                       // caller holds the LVGL lock
+{
+    if (!banner_frost) return;
+    bool show = false;
+    long t_round = 0;
+    if (g_ns.wx_valid && time_valid()) {
+        time_t now = time(nullptr);
+        struct tm t;
+        localtime_r(&now, &t);
+        float tmin = g_ns.day[t.tm_hour < 6 ? 0 : 1].tmin;
+        if (!isnan(tmin) && tmin <= FROST_C) {
+            show = true;
+            t_round = lroundf(tmin);
+        }
+    }
+    static long last_round = LONG_MIN;
+    if (show && t_round != last_round) {
+        char b[96];
+        // U+F2DC snowflake, U+2212 minus, U+00B0 degree, U+00B7 middle dot - all in font_text_18
+        snprintf(b, sizeof(b), "\xEF\x8B\x9C  %s%ld\xC2\xB0" "C tonight \xC2\xB7 protect the water tank and pipes",
+                 t_round < 0 ? "\xE2\x88\x92" : "", labs(t_round));
+        lv_label_set_text(lbl_frost, b);
+        lv_obj_center(lbl_frost);
+        last_round = t_round;
+    }
+    if (show == g_frost) return;
+    g_frost = show;
+    if (show) lv_obj_clear_flag(banner_frost, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag(banner_frost, LV_OBJ_FLAG_HIDDEN);
+    duo_layout(show);
+    vlog("FROST warning %s (forecast low %ld C)", show ? "on" : "off", t_round);
+}
+
+// ---------- page 2: leisure battery history ------------------------------------
+static constexpr int CH_X = 60, CH_Y = 120, CH_W = 700, CH_H = 280;
+static constexpr int HIST_CV_MIN = 1180, HIST_CV_MAX = 1420;      // chart range 11.8 .. 14.2 V
+static lv_obj_t           *hist_chart     = nullptr;
+static lv_chart_series_t  *hist_ser       = nullptr;
+static lv_obj_t           *lbl_hist_sum   = nullptr;
+static lv_obj_t           *lbl_hist_empty = nullptr;
+static lv_obj_t           *btn_h24        = nullptr;
+static lv_obj_t           *btn_h7d        = nullptr;
+static lv_obj_t           *lbl_hist_x[5]  = {};
+static lv_obj_t           *hist_chg[12]   = {};
+static bool                g_hist_7d      = false;
+static HistPoint          *g_hist_tmp     = nullptr;
+
+static int hist_cv_y(float cv) { return CH_Y + CH_H - (int)((cv - HIST_CV_MIN) * CH_H / (HIST_CV_MAX - HIST_CV_MIN)); }
+
+static void refresh_history()                   // caller holds the LVGL lock
+{
+    if (!hist_chart) return;
+    if (!g_hist_tmp) g_hist_tmp = (HistPoint *)heap_caps_malloc(HIST_CAP * sizeof(HistPoint), MALLOC_CAP_SPIRAM);
+    const int      n_buckets = g_hist_7d ? 336 : 288;              // 30 min or 5 min
+    const uint32_t bucket_s  = g_hist_7d ? 1800 : HIST_STEP_S;
+    lv_chart_set_point_count(hist_chart, n_buckets);
+    lv_chart_set_all_value(hist_chart, hist_ser, LV_CHART_POINT_NONE);
+    for (lv_obj_t *r : hist_chg) lv_obj_add_flag(r, LV_OBJ_FLAG_HIDDEN);
+    static const char *X24[5] = {"-24 h", "-18 h", "-12 h", "-6 h", "now"};
+    static const char *X7[5]  = {"-7 d", "-5 d", "-3.5 d", "-1.75 d", "now"};
+    for (int i = 0; i < 5; i++) lv_label_set_text(lbl_hist_x[i], g_hist_7d ? X7[i] : X24[i]);
+    lv_obj_set_style_bg_color(btn_h24, g_hist_7d ? COL_BG : COL_BTN, 0);
+    lv_obj_set_style_bg_color(btn_h7d, g_hist_7d ? COL_BTN : COL_BG, 0);
+
+    int n = 0;
+    time_t now = time(nullptr);
+    time_t from = now - (time_t)n_buckets * bucket_s;
+    if (time_valid() && g_hist_tmp) n = hist_window(from, now, g_hist_tmp, HIST_CAP);
+    if (n == 0) {
+        lv_obj_clear_flag(lbl_hist_empty, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lbl_hist_sum, "");
+        lv_chart_refresh(hist_chart);
+        return;
+    }
+    lv_obj_add_flag(lbl_hist_empty, LV_OBJ_FLAG_HIDDEN);
+
+    // bucket averages + charging runs
+    static int32_t sum[336];
+    static uint16_t cnt[336];
+    static bool chg[336];
+    memset(sum, 0, sizeof(sum));
+    memset(cnt, 0, sizeof(cnt));
+    memset(chg, 0, sizeof(chg));
+    const HistPoint *lo = nullptr, *hi = nullptr;
+    for (int i = 0; i < n; i++) {
+        const HistPoint &q = g_hist_tmp[i];
+        int b = (int)((time_t)q.t - from) / (int)bucket_s;
+        if (b < 0 || b >= n_buckets) continue;
+        sum[b] += q.cv;
+        cnt[b]++;
+        if (q.flags & HIST_CHARGING) chg[b] = true;
+        if (!lo || q.cv < lo->cv) lo = &q;
+        if (!hi || q.cv > hi->cv) hi = &q;
+    }
+    for (int b = 0; b < n_buckets; b++) {
+        if (cnt[b]) lv_chart_set_value_by_id(hist_chart, hist_ser, b,
+                                             LV_CLAMP(HIST_CV_MIN, sum[b] / cnt[b], HIST_CV_MAX));
+    }
+    int r = 0;
+    for (int b = 0; b < n_buckets && r < 12; b++) {
+        if (!chg[b]) continue;
+        int e = b;
+        while (e + 1 < n_buckets && chg[e + 1]) e++;
+        int x0 = CH_X + b * CH_W / n_buckets, x1 = CH_X + (e + 1) * CH_W / n_buckets;
+        lv_obj_set_pos(hist_chg[r], x0, CH_Y);
+        lv_obj_set_size(hist_chg[r], LV_MAX(2, x1 - x0), CH_H);
+        lv_obj_clear_flag(hist_chg[r], LV_OBJ_FLAG_HIDDEN);
+        r++;
+        b = e;
+    }
+    lv_chart_refresh(hist_chart);
+
+    const HistPoint &last = g_hist_tmp[n - 1];
+    char tl[24], th[24], line[128];
+    struct tm t;
+    time_t tt = lo->t;
+    localtime_r(&tt, &t);
+    strftime(tl, sizeof(tl), g_hist_7d ? "%a %H:%M" : "%H:%M", &t);
+    tt = hi->t;
+    localtime_r(&tt, &t);
+    strftime(th, sizeof(th), g_hist_7d ? "%a %H:%M" : "%H:%M", &t);
+    snprintf(line, sizeof(line), "now %.2f V \xC2\xB7 lowest %.2f V (%s) \xC2\xB7 highest %.2f V (%s)",
+             last.cv / 100.0f, lo->cv / 100.0f, tl, hi->cv / 100.0f, th);
+    lv_label_set_text(lbl_hist_sum, line);
+}
+
+static void hist_range_cb(lv_event_t *e)
+{
+    g_hist_7d = lv_event_get_user_data(e) != nullptr;
+    refresh_history();                           // LVGL event: lock already held
+}
+
+static void build_history_page(lv_obj_t *p)
+{
+    lv_obj_t *name = make_label(p, &lv_font_montserrat_26, COL_TEXT);
+    lv_label_set_text(name, "Globebus");
+    lv_obj_set_pos(name, 24, 18);
+    lbl_hist_clock = make_label(p, &font_clock_44, COL_TEXT);
+    lv_label_set_text(lbl_hist_clock, "--:--");
+    lv_obj_align(lbl_hist_clock, LV_ALIGN_TOP_MID, 0, 18);
+
+    btn_h24 = lv_btn_create(p);
+    btn_h7d = lv_btn_create(p);
+    lv_obj_t *btns[2] = {btn_h24, btn_h7d};
+    const char *txt[2] = {"24 h", "7 d"};
+    for (int i = 0; i < 2; i++) {
+        lv_obj_set_size(btns[i], 80, 36);
+        lv_obj_set_pos(btns[i], 590 + i * 92, 22);
+        lv_obj_set_style_radius(btns[i], 18, 0);
+        lv_obj_set_style_shadow_width(btns[i], 0, 0);
+        lv_obj_set_style_border_color(btns[i], COL_BTN, 0);
+        lv_obj_set_style_border_width(btns[i], 2, 0);
+        lv_obj_add_event_cb(btns[i], hist_range_cb, LV_EVENT_CLICKED, i ? (void *)1 : nullptr);
+        lv_obj_t *l = make_label(btns[i], &lv_font_montserrat_18, COL_TEXT);
+        lv_label_set_text(l, txt[i]);
+        lv_obj_center(l);
+    }
+
+    // background bands in the battery fill's colours: red < 25 % usable, yellow < 50 %, green above
+    const float v25 = BAT_EMPTY_V + 0.25f * (BAT_FULL_V - BAT_EMPTY_V);
+    const float v50 = BAT_EMPTY_V + 0.50f * (BAT_FULL_V - BAT_EMPTY_V);
+    int y25 = hist_cv_y(v25 * 100), y50 = hist_cv_y(v50 * 100);
+    lv_obj_t *band;
+    band = make_rect(p, CH_X, CH_Y, CH_W, y50 - CH_Y, DUO_GREEN);
+    lv_obj_set_style_bg_opa(band, 26, 0);
+    band = make_rect(p, CH_X, y50, CH_W, y25 - y50, DUO_YELLOW);
+    lv_obj_set_style_bg_opa(band, 31, 0);
+    band = make_rect(p, CH_X, y25, CH_W, CH_Y + CH_H - y25, DUO_RED);
+    lv_obj_set_style_bg_opa(band, 31, 0);
+    for (lv_obj_t *&r : hist_chg) {
+        r = make_rect(p, CH_X, CH_Y, 2, CH_H, DUO_BLUE);
+        lv_obj_set_style_bg_opa(r, 26, 0);
+        lv_obj_add_flag(r, LV_OBJ_FLAG_HIDDEN);
+    }
+    const int gv[3] = {14, 13, 12};
+    for (int i = 0; i < 3; i++) {
+        int y = hist_cv_y(gv[i] * 100);
+        make_rect(p, CH_X, y, CH_W, 1, COL_TRACK);
+        lv_obj_t *l = make_label(p, &lv_font_montserrat_16, COL_MUTED);
+        lv_label_set_text_fmt(l, "%d V", gv[i]);
+        lv_obj_set_pos(l, 8, y - 10);
+    }
+    for (int i = 0; i < 5; i++) {
+        lbl_hist_x[i] = make_label(p, &lv_font_montserrat_16, COL_MUTED);
+        lv_obj_set_width(lbl_hist_x[i], 80);
+        lv_obj_set_style_text_align(lbl_hist_x[i], LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(lbl_hist_x[i], CH_X + i * CH_W / 4 - 40, CH_Y + CH_H + 8);
+    }
+
+    hist_chart = lv_chart_create(p);
+    lv_obj_remove_style_all(hist_chart);
+    lv_obj_set_pos(hist_chart, CH_X, CH_Y);
+    lv_obj_set_size(hist_chart, CH_W, CH_H);
+    lv_chart_set_type(hist_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_div_line_count(hist_chart, 0, 0);
+    lv_chart_set_range(hist_chart, LV_CHART_AXIS_PRIMARY_Y, HIST_CV_MIN, HIST_CV_MAX);
+    lv_obj_set_style_line_width(hist_chart, 3, LV_PART_ITEMS);
+    lv_obj_set_style_size(hist_chart, 0, LV_PART_INDICATOR);
+    lv_obj_clear_flag(hist_chart, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    hist_ser = lv_chart_add_series(hist_chart, COL_TEXT, LV_CHART_AXIS_PRIMARY_Y);
+
+    lbl_hist_empty = make_label(p, &lv_font_montserrat_20, COL_MUTED);
+    lv_label_set_text(lbl_hist_empty, "No history yet - it builds up on van power with the clock set");
+    lv_obj_align(lbl_hist_empty, LV_ALIGN_TOP_MID, 0, CH_Y + CH_H / 2 - 12);
+    lbl_hist_sum = make_label(p, &font_text_18, COL_MUTED);
+    lv_label_set_text(lbl_hist_sum, "");
+    lv_obj_set_pos(lbl_hist_sum, CH_X, 436);
+
+    page_dots(p, 1);
+    refresh_history();
 }
 
 static void build_gauge_page(lv_obj_t *p)
@@ -1583,6 +2033,7 @@ static void build_gauge_page(lv_obj_t *p)
     lv_label_set_text(lbl_icons, "");
     lv_obj_align_to(lbl_icons, dot_status, LV_ALIGN_OUT_LEFT_MID, -14, 0);
 
+    build_frost_banner(p);
     cont_classic = lv_obj_create(p);                 // theme layers: transparent to touch, full page
     lv_obj_remove_style_all(cont_classic);
     lv_obj_set_size(cont_classic, 800, 480);
@@ -1708,7 +2159,7 @@ static void build_weather_page(lv_obj_t *p)
     lv_obj_align(lbl_wx_msg, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_add_flag(wx_content, LV_OBJ_FLAG_HIDDEN);
-    page_dots(p, 1);
+    page_dots(p, 2);
 }
 
 static void update_weather_page(const NetState &n)
@@ -1773,7 +2224,7 @@ static void build_clock_page(lv_obj_t *p)
     lv_label_set_text(lbl_big_date, "");
     lv_obj_align(lbl_big_date, LV_ALIGN_CENTER, 0, 90);
 
-    page_dots(p, 2);
+    page_dots(p, 3);
 }
 
 // ---------- settings screen --------------------------------------------------
@@ -2249,6 +2700,7 @@ void setup()
 
     system_time_from_rtc();
     vlog_begin();
+    hist_begin();
     log_boot();
 
     {
@@ -2271,8 +2723,9 @@ void setup()
     lv_obj_set_style_bg_color(tv, COL_BG, 0);
     lv_obj_set_scrollbar_mode(tv, LV_SCROLLBAR_MODE_OFF);
     build_gauge_page(lv_tileview_add_tile(tv, 0, 0, LV_DIR_RIGHT));
-    build_weather_page(lv_tileview_add_tile(tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT));
-    build_clock_page(lv_tileview_add_tile(tv, 2, 0, LV_DIR_LEFT));
+    build_history_page(lv_tileview_add_tile(tv, 1, 0, LV_DIR_LEFT | LV_DIR_RIGHT));
+    build_weather_page(lv_tileview_add_tile(tv, 2, 0, LV_DIR_LEFT | LV_DIR_RIGHT));
+    build_clock_page(lv_tileview_add_tile(tv, 3, 0, LV_DIR_LEFT));
     build_settings_screen();
     scr_blank = lv_obj_create(nullptr);             // black, clickable: swallows the waking touch
     lv_obj_set_style_bg_color(scr_blank, lv_color_black(), 0);
@@ -2324,6 +2777,28 @@ void loop()
             if (last_sample_ms > BOOT_IGNORE_MS) log_sample();
             else last_sample_ms = 0;
         }
+        static uint32_t last_live_ms = 0;            // Duo idle: live leisure battery every 2 s
+        if (millis() - last_live_ms >= 2000) {
+            last_live_ms = millis();
+            if (!g_display_ms && !g_screen_off && g_theme_idx == 1) {
+                lvgl_port_lock(-1);
+                duo_show_live();
+                lvgl_port_unlock();
+            }
+        }
+        static time_t last_hist_slot = 0;            // battery history: one point per 5-minute slot
+        if (time_valid() && !isnan(g_supply_v)) {
+            time_t slot = time(nullptr) / HIST_STEP_S;
+            if (slot != last_hist_slot) {
+                last_hist_slot = slot;
+                float v = live_battery_v();
+                hist_add(time(nullptr), v, v >= CHARGING_V);
+                lvgl_port_lock(-1);
+                refresh_history();
+                lvgl_port_unlock();
+            }
+        }
+        hist_save_if_due();
         static uint32_t last_supply_ms = 0;
         if (millis() - last_supply_ms >= 1000) {
             last_supply_ms = millis();
