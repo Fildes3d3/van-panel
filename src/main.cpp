@@ -769,18 +769,16 @@ static const lv_color_t DUO_YELLOW = lv_color_hex(0xE0B030);
 static const lv_color_t DUO_GREEN  = lv_color_hex(0x639922);
 static const lv_color_t DUO_BLUE   = lv_color_hex(0x3D78D8);
 
-// Battery fill from the volts: the usual 12 V lead-acid resting-voltage table (Modern Survival Blog, Clever Solar
-// Power, Wind & Solar, Inspire Clean Energy agree within ~0.1 V): 11.9 V empty, 12.05 25 %, 12.25 50 %, 12.45 75 %,
-// 12.65 full. Resting values only - under load it reads low, on charge it reads full. The number below is exact.
+// Battery fill = USABLE capacity of a flooded lead-acid battery (user decision 2026-10-23; both batteries are
+// flooded): 12.2 V (about 50 % state of charge, the usual lowest point to discharge to) is empty, 12.7 V (full at
+// rest) is full, linear in between - the resting-voltage table is close to linear there (12.25 V ~50 %, 12.45 ~75 %,
+// 12.65 ~100 %; Modern Survival Blog, Clever Solar Power, Wind & Solar, Inspire Clean Energy). 12.6 V shows 80 %,
+// 12.4 V 40 %. Resting values only: under load it reads low, on charge (or with surface charge) it reads full.
+static constexpr float BAT_EMPTY_V = 12.2f;
+static constexpr float BAT_FULL_V  = 12.7f;
 static float battery_fill(float volts)
 {
-    static const float V[] = {11.90f, 12.05f, 12.25f, 12.45f, 12.65f};
-    static const float F[] = {0.00f, 0.25f, 0.50f, 0.75f, 1.00f};
-    if (volts <= V[0]) return 0.0f;
-    for (int i = 0; i < 4; i++) {
-        if (volts < V[i + 1]) return F[i] + (volts - V[i]) / (V[i + 1] - V[i]) * (F[i + 1] - F[i]);
-    }
-    return 1.0f;
+    return clampf((volts - BAT_EMPTY_V) / (BAT_FULL_V - BAT_EMPTY_V), 0, 1);
 }
 
 // "<=50 %" is drawn striped: a 16 x 16 tile of diagonal stripes in two blues, repeated over the fill.
