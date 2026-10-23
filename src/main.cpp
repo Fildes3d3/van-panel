@@ -76,6 +76,7 @@ using namespace esp_panel::drivers;
 using namespace esp_panel::board;
 
 LV_FONT_DECLARE(font_num_88);
+LV_FONT_DECLARE(font_num_56);
 LV_FONT_DECLARE(font_clock_44);
 LV_FONT_DECLARE(font_clock_170);
 LV_FONT_DECLARE(font_icon_44);
@@ -343,6 +344,19 @@ static lv_obj_t *mk_bat      = nullptr;
 static lv_obj_t *mk_wat      = nullptr;
 static lv_obj_t *lbl_state   = nullptr;
 static lv_obj_t *pill_prov   = nullptr;
+
+// Themes for the gauge page (user, 2026-10-23): "Toptron Classic" = the dial scales above; "Duo" = two rectangles
+// side by side, battery left (red/yellow/green fill), water right (blue fill), value under each. Both layers are
+// built and updated; the theme only decides which one is visible. Saved in NVS "globebus"/"theme".
+static const char *THEME_OPTS   = "Toptron Classic\nDuo";
+static int         g_theme_idx  = 0;
+static lv_obj_t   *dd_theme     = nullptr;
+static lv_obj_t   *cont_classic = nullptr;
+static lv_obj_t   *cont_duo     = nullptr;
+static lv_obj_t   *duo_bat_fill = nullptr;
+static lv_obj_t   *duo_wat_fill = nullptr;
+static lv_obj_t   *duo_lbl_volt = nullptr;
+static lv_obj_t   *duo_lbl_pct  = nullptr;
 
 // page 2 (weather)
 static lv_obj_t *lbl_wx_clock = nullptr;
@@ -747,6 +761,70 @@ static bool tank_is_low(float mv)
     return mv < TANK_BANDS[sizeof(TANK_BANDS) / sizeof(TANK_BANDS[0]) - 1].min_mv;
 }
 
+// ---------- theme "Duo" -------------------------------------------------------
+
+static constexpr int DUO_W = 210, DUO_H = 260, DUO_Y = 86, DUO_BAT_X = 115, DUO_WAT_X = 475;
+static const lv_color_t DUO_RED    = lv_color_hex(0xE5483D);
+static const lv_color_t DUO_YELLOW = lv_color_hex(0xE0B030);
+static const lv_color_t DUO_GREEN  = lv_color_hex(0x639922);
+static const lv_color_t DUO_BLUE   = lv_color_hex(0x3D78D8);
+
+// Battery fill from the volts: the usual 12 V lead-acid resting-voltage table (Modern Survival Blog, Clever Solar
+// Power, Wind & Solar, Inspire Clean Energy agree within ~0.1 V): 11.9 V empty, 12.05 25 %, 12.25 50 %, 12.45 75 %,
+// 12.65 full. Resting values only - under load it reads low, on charge it reads full. The number below is exact.
+static float battery_fill(float volts)
+{
+    static const float V[] = {11.90f, 12.05f, 12.25f, 12.45f, 12.65f};
+    static const float F[] = {0.00f, 0.25f, 0.50f, 0.75f, 1.00f};
+    if (volts <= V[0]) return 0.0f;
+    for (int i = 0; i < 4; i++) {
+        if (volts < V[i + 1]) return F[i] + (volts - V[i]) / (V[i + 1] - V[i]) * (F[i + 1] - F[i]);
+    }
+    return 1.0f;
+}
+
+// "<=50 %" is drawn striped: a 16 x 16 tile of diagonal stripes in two blues, repeated over the fill.
+static lv_color_t   g_hatch_px[16 * 16];
+static lv_img_dsc_t g_hatch_img;
+static void make_hatch()
+{
+    for (int y = 0; y < 16; y++)
+        for (int x = 0; x < 16; x++)
+            g_hatch_px[y * 16 + x] = ((x + y) % 16) < 7 ? DUO_BLUE : lv_color_hex(0x2C5AA6);
+    g_hatch_img.header.always_zero = 0;
+    g_hatch_img.header.w  = 16;
+    g_hatch_img.header.h  = 16;
+    g_hatch_img.header.cf = LV_IMG_CF_TRUE_COLOR;
+    g_hatch_img.data_size = sizeof(g_hatch_px);
+    g_hatch_img.data      = (const uint8_t *)g_hatch_px;
+}
+
+static void duo_set_fill(lv_obj_t *fill, float frac, lv_color_t color, bool striped)
+{
+    int h = (int)(clampf(frac, 0, 1) * DUO_H + 0.5f);
+    if (h <= 0) {
+        lv_obj_add_flag(fill, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_set_height(fill, h);
+    lv_obj_align(fill, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(fill, color, 0);
+    lv_obj_set_style_bg_img_src(fill, striped ? &g_hatch_img : nullptr, 0);
+    lv_obj_clear_flag(fill, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void apply_theme()
+{
+    if (!cont_classic || !cont_duo) return;
+    if (g_theme_idx == 1) {
+        lv_obj_add_flag(cont_classic, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(cont_duo, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(cont_duo, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(cont_classic, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void show_value(float mv, bool live = false)
 {
     float volts = VOLT_OFFSET + VOLT_PER_MV * mv;
@@ -774,6 +852,16 @@ static void show_value(float mv, bool live = false)
     lv_obj_set_style_text_color(lbl_pct, COL_TEXT, 0);
     place_marker(mk_bat, BAT_BAR_Y, frac);
     place_marker(mk_wat, WAT_BAR_Y, tfrac);
+    {
+        float bf = battery_fill(volts);
+        lv_color_t bc = bf < 0.25f ? DUO_RED : (bf < 0.5f ? DUO_YELLOW : DUO_GREEN);
+        duo_set_fill(duo_bat_fill, bf, bc, false);
+        duo_set_fill(duo_wat_fill, tfrac, DUO_BLUE, tank_is_low(mv));
+        lv_label_set_text(duo_lbl_volt, v);
+        lv_label_set_text(duo_lbl_pct, p);
+        lv_obj_set_style_text_color(duo_lbl_volt, COL_TEXT, 0);
+        lv_obj_set_style_text_color(duo_lbl_pct, COL_TEXT, 0);
+    }
     lvgl_port_unlock();
 
     g_display_ms = millis();
@@ -790,6 +878,12 @@ static void clear_value()
     lv_obj_set_style_text_color(lbl_pct, COL_DIM, 0);
     lv_obj_add_flag(mk_bat, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(mk_wat, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(duo_bat_fill, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(duo_wat_fill, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(duo_lbl_volt, "-- V");
+    lv_label_set_text(duo_lbl_pct, "-- %");
+    lv_obj_set_style_text_color(duo_lbl_volt, COL_DIM, 0);
+    lv_obj_set_style_text_color(duo_lbl_pct, COL_DIM, 0);
     lv_label_set_text(lbl_state, "Hold a selector on the panel");
     lvgl_port_unlock();
     g_display_ms = 0;
@@ -923,6 +1017,17 @@ static void bl_test_cb(lv_event_t *e)
     g_bl_test_end = millis() + BL_TEST_MS;
     if (g_bl_test_end == 0) g_bl_test_end = 1;
     Serial.println("[screen] backlight test: off for 5 s");
+}
+
+static void theme_dd_cb(lv_event_t *e)
+{
+    g_theme_idx = lv_dropdown_get_selected(dd_theme);
+    Preferences p;
+    p.begin("globebus", false);
+    p.putUChar("theme", (uint8_t)g_theme_idx);
+    p.end();
+    apply_theme();                                // called from an LVGL event: the lock is already held
+    vlog("SETTING theme %s", g_theme_idx == 1 ? "Duo" : "Toptron Classic");
 }
 
 static void timeout_dd_cb(lv_event_t *e)
@@ -1414,6 +1519,51 @@ static void build_water_scale(lv_obj_t *p)
     mk_wat = make_marker(p);
 }
 
+static lv_obj_t *duo_box(lv_obj_t *parent, int x, lv_obj_t **fill)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_pos(box, x, DUO_Y);
+    lv_obj_set_size(box, DUO_W, DUO_H);
+    lv_obj_set_style_radius(box, 16, 0);
+    lv_obj_set_style_clip_corner(box, true, 0);
+    lv_obj_set_style_border_color(box, lv_color_white(), 0);
+    lv_obj_set_style_border_width(box, 6, 0);
+    lv_obj_set_style_border_post(box, true, 0);      // outline drawn over the fill
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    *fill = lv_obj_create(box);
+    lv_obj_remove_style_all(*fill);
+    lv_obj_set_width(*fill, DUO_W);
+    lv_obj_set_style_bg_opa(*fill, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_img_tiled(*fill, true, 0);
+    lv_obj_clear_flag(*fill, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(*fill, LV_OBJ_FLAG_HIDDEN);
+    return box;
+}
+
+static lv_obj_t *duo_value(lv_obj_t *parent, int center_x, const char *text)
+{
+    lv_obj_t *l = make_label(parent, &font_num_56, COL_DIM);
+    lv_obj_set_width(l, 340);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(l, text);
+    lv_obj_set_pos(l, center_x - 170, DUO_Y + DUO_H + 12);
+    return l;
+}
+
+static void build_duo_layer(lv_obj_t *p)
+{
+    make_hatch();
+    cont_duo = lv_obj_create(p);
+    lv_obj_remove_style_all(cont_duo);
+    lv_obj_set_size(cont_duo, 800, 480);
+    lv_obj_clear_flag(cont_duo, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    duo_box(cont_duo, DUO_BAT_X, &duo_bat_fill);
+    duo_box(cont_duo, DUO_WAT_X, &duo_wat_fill);
+    duo_lbl_volt = duo_value(cont_duo, DUO_BAT_X + DUO_W / 2, "-- V");
+    duo_lbl_pct  = duo_value(cont_duo, DUO_WAT_X + DUO_W / 2, "-- %");
+}
+
 static void build_gauge_page(lv_obj_t *p)
 {
     lv_obj_t *name = make_label(p, &lv_font_montserrat_26, COL_TEXT);
@@ -1435,20 +1585,27 @@ static void build_gauge_page(lv_obj_t *p)
     lv_label_set_text(lbl_icons, "");
     lv_obj_align_to(lbl_icons, dot_status, LV_ALIGN_OUT_LEFT_MID, -14, 0);
 
-    lbl_volt = make_label(p, &font_num_88, COL_DIM);
+    cont_classic = lv_obj_create(p);                 // theme layers: transparent to touch, full page
+    lv_obj_remove_style_all(cont_classic);
+    lv_obj_set_size(cont_classic, 800, 480);
+    lv_obj_clear_flag(cont_classic, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    build_duo_layer(p);
+
+    lbl_volt = make_label(cont_classic, &font_num_88, COL_DIM);
     lv_obj_set_width(lbl_volt, 400);
     lv_obj_set_style_text_align(lbl_volt, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(lbl_volt, "-- V");
     lv_obj_set_pos(lbl_volt, 0, 118);
 
-    lbl_pct = make_label(p, &font_num_88, COL_DIM);
+    lbl_pct = make_label(cont_classic, &font_num_88, COL_DIM);
     lv_obj_set_width(lbl_pct, 400);
     lv_obj_set_style_text_align(lbl_pct, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(lbl_pct, "-- %");
     lv_obj_set_pos(lbl_pct, 400, 118);
 
-    build_battery_scale(p);
-    build_water_scale(p);
+    build_battery_scale(cont_classic);
+    build_water_scale(cont_classic);
+    apply_theme();
 
     lbl_state = make_label(p, &lv_font_montserrat_18, COL_MUTED);
     lv_label_set_text(lbl_state, "Hold a selector on the panel");
@@ -1763,6 +1920,18 @@ static void build_display_tab(lv_obj_t *t)
     lv_label_set_text(n2, "\"Keep reading\" is how long the last measured value stays on the gauge page after you let "
                           "go of the selector. Until release matches the old gauge, whose needle fell back.");
     lv_obj_set_pos(n2, 0, 210);
+
+    lv_obj_t *l3 = make_label(t, &lv_font_montserrat_22, COL_TEXT);
+    lv_label_set_text(l3, "Theme");
+    lv_obj_set_pos(l3, 0, 280);
+    dd_theme = lv_dropdown_create(t);
+    lv_dropdown_set_options_static(dd_theme, THEME_OPTS);
+    lv_dropdown_set_selected(dd_theme, g_theme_idx);
+    lv_obj_set_width(dd_theme, 260);
+    lv_obj_set_style_text_font(dd_theme, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(dd_theme), &lv_font_montserrat_22, 0);
+    lv_obj_set_pos(dd_theme, 330, 270);
+    lv_obj_add_event_cb(dd_theme, theme_dd_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 }
 
 static void build_diag_tab(lv_obj_t *t)
@@ -2089,6 +2258,8 @@ void setup()
         p.begin("globebus", true);
         int idx = p.getUChar("disp_to", TIMEOUT_DEFAULT);
         int hidx = p.getUChar("hold", HOLD_DEFAULT);
+        int tidx = p.getUChar("theme", 0);
+        g_theme_idx = (tidx == 1) ? 1 : 0;
         p.end();
         g_hold_idx = (hidx >= 0 && hidx < (int)(sizeof(HOLD_SECONDS) / sizeof(HOLD_SECONDS[0]))) ? hidx : HOLD_DEFAULT;
         g_timeout_idx = (idx >= 0 && idx < (int)(sizeof(TIMEOUT_MIN) / sizeof(TIMEOUT_MIN[0]))) ? idx : TIMEOUT_DEFAULT;
