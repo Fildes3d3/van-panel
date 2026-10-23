@@ -72,6 +72,9 @@
 #include <esp_system.h>
 #include <esp_core_dump.h>
 #include <esp_app_desc.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 
 using namespace esp_panel::drivers;
 using namespace esp_panel::board;
@@ -351,6 +354,13 @@ static lv_obj_t *pill_prov   = nullptr;
 // side by side, battery left (red/yellow/green fill), water right (blue fill), value under each. Both layers are
 // built and updated; the theme only decides which one is visible. Saved in NVS "globebus"/"theme".
 static const char *THEME_OPTS   = "Toptron Classic\nDuo";
+// Night mode (user, 2026-10-23): same layout, every colour mapped to dim red on black by an LVGL colour filter.
+// The backlight is on/off only on this board, so colour is the only lever. Auto = sunset to sunrise (forecast).
+static const char *NIGHT_OPTS   = "Off\nAuto (sunset)\nAlways";
+static int         g_night_idx  = 1;
+static lv_obj_t   *dd_night     = nullptr;
+static bool        g_night_on   = false;
+static bool        g_web_on     = false;          // phone page server started (see web_poll)
 static int         g_theme_idx  = 0;
 static lv_obj_t   *dd_theme     = nullptr;
 static lv_obj_t   *cont_classic = nullptr;
@@ -366,7 +376,7 @@ static lv_obj_t *lbl_wx_place = nullptr;
 static lv_obj_t *lbl_wx_icon  = nullptr;
 static lv_obj_t *lbl_wx_temp  = nullptr;
 static lv_obj_t *lbl_wx_cond  = nullptr;
-static lv_obj_t *lbl_wx_det[3] = {};
+static lv_obj_t *lbl_wx_det[4] = {};          // wind, humidity, today min/max, sunrise/sunset
 static lv_obj_t *lbl_wx_day[WX_DAYS][4] = {};   // label, icon, temps, pop
 static lv_obj_t *lbl_wx_foot  = nullptr;
 static lv_obj_t *lbl_wx_msg   = nullptr;
@@ -719,6 +729,72 @@ static void rtc_from_system_time(const char *why)
 static void on_ntp_synced() { g_ntp_synced = true; }   // runs in the network task: just flag it
 
 static void update_frost();
+static void rem_tick();
+
+// ---------- night mode -----------------------------------------------------------
+static lv_style_t            g_night_style;
+static lv_color_filter_dsc_t g_night_filter;
+
+static lv_color_t night_filter_cb(const lv_color_filter_dsc_t *, lv_color_t c, lv_opa_t)
+{
+    lv_color32_t c32;
+    c32.full = lv_color_to32(c);
+    uint32_t y = (c32.ch.red * 77u + c32.ch.green * 150u + c32.ch.blue * 29u) >> 8;   // luminance
+    return lv_color_make((uint8_t)(y * 160 / 255), (uint8_t)(y * 38 / 255), (uint8_t)(y * 30 / 255));
+}
+
+// The filter is not inherited in LVGL 8, so the style goes on every object (labels: main part only).
+static void night_walk(lv_obj_t *o, bool on)
+{
+    static const lv_style_selector_t parts[] = {LV_PART_MAIN, LV_PART_INDICATOR, LV_PART_ITEMS, LV_PART_KNOB,
+                                                LV_PART_SELECTED};
+    lv_obj_remove_style(o, &g_night_style, LV_PART_ANY | LV_STATE_ANY);   // never twice
+    if (on) {
+        int n = lv_obj_check_type(o, &lv_label_class) ? 1 : 5;
+        for (int i = 0; i < n; i++) lv_obj_add_style(o, &g_night_style, parts[i]);
+    }
+    uint32_t cnt = lv_obj_get_child_cnt(o);
+    for (uint32_t i = 0; i < cnt; i++) night_walk(lv_obj_get_child(o, i), on);
+}
+
+static void night_apply(bool on, bool force = false)   // caller holds the LVGL lock
+{
+    static bool inited = false;
+    if (!inited) {
+        lv_style_init(&g_night_style);
+        lv_color_filter_dsc_init(&g_night_filter, night_filter_cb);
+        lv_style_set_color_filter_dsc(&g_night_style, &g_night_filter);
+        lv_style_set_color_filter_opa(&g_night_style, LV_OPA_COVER);
+        lv_style_set_img_recolor(&g_night_style, lv_color_hex(0x5A1E18));     // images: wave strip, marker
+        lv_style_set_img_recolor_opa(&g_night_style, LV_OPA_COVER);
+        lv_style_set_bg_img_recolor(&g_night_style, lv_color_hex(0x5A1E18));  // the "<=50 %" stripes
+        lv_style_set_bg_img_recolor_opa(&g_night_style, 190);              // keep a hint of the stripes
+        inited = true;
+    }
+    if (on == g_night_on && !force) return;
+    bool changed = on != g_night_on;
+    g_night_on = on;
+    if (scr_main) night_walk(scr_main, on);
+    if (scr_set)  night_walk(scr_set, on);
+    if (changed) vlog("NIGHT mode %s", on ? "on" : "off");
+}
+
+static bool night_wanted()
+{
+    if (g_night_idx == 0) return false;
+    if (g_night_idx == 2) return true;
+    if (!time_valid()) return false;
+    time_t now = time(nullptr);
+    struct tm t;
+    localtime_r(&now, &t);
+    int m = t.tm_hour * 60 + t.tm_min;
+    int sr = 7 * 60, ss = 20 * 60;                                     // without a forecast
+    if (g_ns.wx_valid && g_ns.day[0].sunrise_min >= 0 && g_ns.day[0].sunset_min >= 0) {
+        sr = g_ns.day[0].sunrise_min;
+        ss = g_ns.day[0].sunset_min;
+    }
+    return m < sr || m >= ss;
+}
 
 static void update_clocks()
 {
@@ -738,6 +814,13 @@ static void update_clocks()
     lv_label_set_text(lbl_wx_clock, hm);
     if (lbl_hist_clock) lv_label_set_text(lbl_hist_clock, hm);
     update_frost();
+    night_apply(night_wanted());
+    static int last_min = -1;                         // reminders: once a minute
+    int min_now = (int)(time(nullptr) / 60);
+    if (min_now != last_min) {
+        last_min = min_now;
+        rem_tick();
+    }
     lv_label_set_text(lbl_big_clock, hm);
     lv_label_set_text(lbl_big_date, date);
     lvgl_port_unlock();
@@ -1025,6 +1108,24 @@ static void apply_theme()
     }
 }
 
+// With the charger charging (VIN above 13.0 V, bulk/absorption) the tank output reads high by a roughly fixed
+// amount: clean tank at 1/2 read 54.9 mV at 13.28 and 13.67 V vs 35.5 mV with the charger off (2026-10-13) -> -19.4 mV.
+// One level, one day of data. Maintenance charging (~12.5 V at VIN, ~+8 mV) cannot be told from voltage: not handled.
+static constexpr float TANK_CHARGE_SUPPLY_V  = 13.0f;
+static constexpr float TANK_CHARGE_OFFSET_MV = 19.4f;
+static float tank_mv(float mv)
+{
+    float s = g_press.supply_v;
+    return (!isnan(s) && s > TANK_CHARGE_SUPPLY_V) ? mv - TANK_CHARGE_OFFSET_MV : mv;
+}
+
+// Last shown reading, for the phone page.
+static float  g_last_v     = NAN;
+static float  g_last_tfill = NAN;
+static bool   g_last_low   = false;
+static char   g_last_tank[16] = "";
+static time_t g_last_at    = 0;
+
 static void show_value(float mv, bool live = false)
 {
     float volts = VOLT_OFFSET + VOLT_PER_MV * mv;
@@ -1037,13 +1138,21 @@ static void show_value(float mv, bool live = false)
         return;
     }
     float frac  = (volts - DIAL_V_MIN) / (DIAL_V_MAX - DIAL_V_MIN);
-    float tfrac = tank_frac(mv);
+    float tmv   = tank_mv(mv);
+    float tfrac = tank_frac(tmv);
     float pct   = tfrac * 100.0f;
     bool  red   = volts < RED_LOW_V || volts > RED_HIGH_V;
     char v[16], p[16];
     snprintf(v, sizeof(v), "%.1f V", volts);
-    if (tank_is_low(mv)) snprintf(p, sizeof(p), "%s", TANK_LOW_TEXT);
-    else                 snprintf(p, sizeof(p), "%.0f %%", pct);
+    if (tank_is_low(tmv)) snprintf(p, sizeof(p), "%s", TANK_LOW_TEXT);
+    else                  snprintf(p, sizeof(p), "%.0f %%", pct);
+    if (!live) {
+        g_last_v = volts;
+        g_last_tfill = tfrac;
+        g_last_low = tank_is_low(tmv);
+        snprintf(g_last_tank, sizeof(g_last_tank), "%s", tank_is_low(tmv) ? "<=50 %" : p);
+        g_last_at = time(nullptr);
+    }
 
     lvgl_port_lock(-1);
     lv_label_set_text(lbl_volt, v);
@@ -1056,7 +1165,7 @@ static void show_value(float mv, bool live = false)
         float bf = battery_fill(volts);
         lv_color_t bc = bf < 0.25f ? DUO_RED : (bf < 0.5f ? DUO_YELLOW : DUO_GREEN);
         duo_set_fill(duo_bat_fill, bf, bc, false);
-        duo_set_fill(duo_wat_fill, tfrac, DUO_BLUE, tank_is_low(mv));
+        duo_set_fill(duo_wat_fill, tfrac, DUO_BLUE, tank_is_low(tmv));
         bat_pulse(false);                         // a press shows the pressed channel, not the live battery
         lv_obj_add_flag(duo_bolt, LV_OBJ_FLAG_HIDDEN);
         g_duo_live = false;
@@ -1337,7 +1446,7 @@ static void press_end()
     {
         float shown = end_mv;
         float volts = VOLT_OFFSET + VOLT_PER_MV * shown;
-        float pct   = tank_frac(shown) * 100.0f;     // "<=50" is logged as 50
+        float pct   = tank_frac(tank_mv(shown)) * 100.0f;   // "<=50" is logged as 50; charger-corrected
         vlog("PRESS #%lu %.1fs first %.2f @0.5s %s end %.2f peak %.2f mV -> %.2f V / tank %.0f %%, supply %.2f V",
              (unsigned long)g_press.n, dur / 1000.0f, g_press.first_mv, a[1], end_mv, g_press.peak_mv, volts, pct,
              g_press.supply_v);
@@ -1375,7 +1484,11 @@ static void run_diagnostics()
     float a0 = NAN, a1 = NAN;
     bool ok0 = ads_read_volts(MUX_AIN0, PGA_4V096, &a0);
     bool ok1 = ads_read_volts(MUX_AIN1, PGA_4V096, &a1);
-    char s0[16], s1[16], sd[16], sup[40], line[500];
+    char s0[16], s1[16], sd[16], sup[40], webaddr[64], line[600];
+    if (g_web_on && WiFi.isConnected())
+        snprintf(webaddr, sizeof(webaddr), "http://globebus.local  or  http://%s", WiFi.localIP().toString().c_str());
+    else
+        snprintf(webaddr, sizeof(webaddr), "needs Wi-Fi");
     if (isnan(g_supply_v)) snprintf(sup, sizeof(sup), "-- (no van feed)");
     else                   snprintf(sup, sizeof(sup), "%.2f V (now %.2f V)", g_supply_v, g_supply_raw);
     if (isnan(g_idle_mv)) snprintf(sd, sizeof(sd), "--");
@@ -1398,7 +1511,7 @@ static void run_diagnostics()
     snprintf(line, sizeof(line),
              "Idle: A0 %s V   A1 %s V (signal- vs board GND)   A0-A1 %s mV   I2C/ADC errors: %lu%s\n"
              "Supply %s   Uptime %02lu:%02lu:%02lu   presses %lu (rejected %lu, stuck %lu)   wire %s (%lu)   free heap %lu B (internal %lu B)   built " __DATE__ " " __TIME__
-             "\nVolts %s: V = %.3f + %.5f x mV   tank (charger off): >=%.1f full, >=%.1f 3/4, below <=1/2 mV",
+             "\nVolts %s: V = %.3f + %.5f x mV   tank (charger off): >=%.1f full, >=%.1f 3/4, below <=1/2 mV\nPhone page: %s",
              s0, s1, sd, (unsigned long)g_read_errors, err_when, sup, (unsigned long)(s / 3600),
              (unsigned long)((s / 60) % 60), (unsigned long)(s % 60), (unsigned long)g_press.n,
              (unsigned long)g_rejected, (unsigned long)g_stuck, g_wire_loose ? "OPEN" : "ok",
@@ -1406,7 +1519,7 @@ static void run_diagnostics()
              (unsigned long)ESP.getFreeHeap(),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              VOLT_CALIBRATED ? "calibrated" : "PROVISIONAL", VOLT_OFFSET, VOLT_PER_MV,
-             TANK_BANDS[0].min_mv, TANK_BANDS[1].min_mv);
+             TANK_BANDS[0].min_mv, TANK_BANDS[1].min_mv, webaddr);
     char sline[260];
     if (g_bl_change_ms) {
         uint32_t ago = (millis() - g_bl_change_ms) / 1000;
@@ -1545,6 +1658,7 @@ static void open_settings_cb(lv_event_t *e)
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     load_set_from_clock();
     refresh_set_labels();
+    if (g_night_on) night_apply(true, true);      // objects created since (Wi-Fi list) get the night colours too
     lv_scr_load(scr_set);
 }
 
@@ -1783,21 +1897,44 @@ static constexpr float FROST_C = 0.0f;
 static lv_obj_t *banner_frost = nullptr;
 static lv_obj_t *lbl_frost    = nullptr;
 static bool      g_frost      = false;
+static char      g_frost_text[96] = "";
+// Low leisure battery (live value in the red band for 2 min; clears in the green band). Takes priority over frost.
+static lv_obj_t *banner_low   = nullptr;
+static lv_obj_t *lbl_low      = nullptr;
+static bool      g_low_bat    = false;
+
+static lv_obj_t *make_banner(lv_obj_t *p, lv_color_t bg, lv_color_t fg, lv_obj_t **lbl)
+{
+    lv_obj_t *b = lv_obj_create(p);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_pos(b, 160, 62);
+    lv_obj_set_size(b, 480, 30);
+    lv_obj_set_style_radius(b, 15, 0);
+    lv_obj_set_style_bg_color(b, bg, 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(b, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);
+    *lbl = make_label(b, &font_text_18, fg);
+    lv_label_set_text(*lbl, "");
+    lv_obj_center(*lbl);
+    return b;
+}
+
+static void update_banners()                     // caller holds the LVGL lock
+{
+    if (!banner_frost || !banner_low) return;
+    bool low = g_low_bat, frost = g_frost && !low;
+    if (low)   lv_obj_clear_flag(banner_low, LV_OBJ_FLAG_HIDDEN);
+    else       lv_obj_add_flag(banner_low, LV_OBJ_FLAG_HIDDEN);
+    if (frost) lv_obj_clear_flag(banner_frost, LV_OBJ_FLAG_HIDDEN);
+    else       lv_obj_add_flag(banner_frost, LV_OBJ_FLAG_HIDDEN);
+    duo_layout(low || frost);
+}
 
 static void build_frost_banner(lv_obj_t *p)
 {
-    banner_frost = lv_obj_create(p);
-    lv_obj_remove_style_all(banner_frost);
-    lv_obj_set_pos(banner_frost, 160, 62);
-    lv_obj_set_size(banner_frost, 480, 30);
-    lv_obj_set_style_radius(banner_frost, 15, 0);
-    lv_obj_set_style_bg_color(banner_frost, lv_color_hex(0x123A5C), 0);
-    lv_obj_set_style_bg_opa(banner_frost, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(banner_frost, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(banner_frost, LV_OBJ_FLAG_HIDDEN);
-    lbl_frost = make_label(banner_frost, &font_text_18, lv_color_hex(0xCFE8FF));
-    lv_label_set_text(lbl_frost, "");
-    lv_obj_center(lbl_frost);
+    banner_frost = make_banner(p, lv_color_hex(0x123A5C), lv_color_hex(0xCFE8FF), &lbl_frost);
+    banner_low   = make_banner(p, lv_color_hex(0x5C1A16), lv_color_hex(0xFFC9C3), &lbl_low);
 }
 
 static void update_frost()                       // caller holds the LVGL lock
@@ -1823,14 +1960,14 @@ static void update_frost()                       // caller holds the LVGL lock
                  t_round < 0 ? "\xE2\x88\x92" : "", labs(t_round));
         lv_label_set_text(lbl_frost, b);
         lv_obj_center(lbl_frost);
+        snprintf(g_frost_text, sizeof(g_frost_text), "%s%ld \xC2\xB0" "C tonight \xC2\xB7 protect the water tank and pipes",
+                 t_round < 0 ? "-" : "", labs(t_round));
         last_round = t_round;
     }
     if (show == g_frost) return;
     g_frost = show;
-    if (show) lv_obj_clear_flag(banner_frost, LV_OBJ_FLAG_HIDDEN);
-    else      lv_obj_add_flag(banner_frost, LV_OBJ_FLAG_HIDDEN);
-    duo_layout(show);
     vlog("FROST warning %s (forecast low %ld C)", show ? "on" : "off", t_round);
+    update_banners();
 }
 
 // ---------- page 2: leisure battery history ------------------------------------
@@ -2122,8 +2259,8 @@ static void build_weather_page(lv_obj_t *p)
     lv_label_set_text(lbl_wx_cond, "");
     lv_obj_set_pos(lbl_wx_cond, 254, 116);
 
-    static const char *const det_icons[3] = {FA_WIND, FA_TINT, FA_ARROWSV};
-    for (int i = 0; i < 3; i++) {
+    static const char *const det_icons[4] = {FA_WIND, FA_TINT, FA_ARROWSV, FA_SUN};
+    for (int i = 0; i < 4; i++) {
         lv_obj_t *ic = make_label(wx_content, &font_sym_22, COL_MUTED);
         lv_label_set_text(ic, det_icons[i]);
         lv_obj_set_pos(ic, 560, 30 + i * 36);
@@ -2193,6 +2330,12 @@ static void update_weather_page(const NetState &n)
     lv_label_set_text(lbl_wx_det[1], buf);
     snprintf(buf, sizeof(buf), "%.0f\xC2\xB0 / %.0f\xC2\xB0", n.day[0].tmin, n.day[0].tmax);
     lv_label_set_text(lbl_wx_det[2], buf);
+    if (n.day[0].sunrise_min >= 0 && n.day[0].sunset_min >= 0)
+        snprintf(buf, sizeof(buf), "%02d:%02d / %02d:%02d", n.day[0].sunrise_min / 60, n.day[0].sunrise_min % 60,
+                 n.day[0].sunset_min / 60, n.day[0].sunset_min % 60);
+    else
+        snprintf(buf, sizeof(buf), "--");
+    lv_label_set_text(lbl_wx_det[3], buf);
 
     for (int d = 0; d < WX_DAYS; d++) {
         const WxDay &w = n.day[d];
@@ -2214,6 +2357,150 @@ static void update_weather_page(const NetState &n)
 
 // ---------- page 3: big clock ------------------------------------------------
 
+// ---------- reminders --------------------------------------------------------------
+// Three countdowns (user-approved mockup 2026-10-23); interval -/+ in 5-day steps, "Done" restarts the countdown.
+// Saved in NVS "globebus": remNd (days), remNt (unix time last done). The countdown starts the first time the
+// clock is valid.
+struct Reminder {
+    const char *name;
+    uint16_t    days;
+    uint32_t    done;
+    lv_obj_t   *lbl_iv;
+    lv_obj_t   *lbl_due;
+};
+static Reminder  g_rem[] = {{"Battery water", 30, 0, nullptr, nullptr},
+                            {"Water filter", 90, 0, nullptr, nullptr},
+                            {"Gas bottle", 60, 0, nullptr, nullptr}};
+static constexpr int REM_N = sizeof(g_rem) / sizeof(g_rem[0]);
+static lv_obj_t *rem_strip     = nullptr;
+static lv_obj_t *rem_strip_lbl = nullptr;
+static int       g_rem_due     = -1;
+
+static void rem_load()
+{
+    Preferences p;
+    p.begin("globebus", true);
+    for (int i = 0; i < REM_N; i++) {
+        char k[8];
+        snprintf(k, sizeof(k), "rem%dd", i);
+        g_rem[i].days = p.getUShort(k, g_rem[i].days);
+        snprintf(k, sizeof(k), "rem%dt", i);
+        g_rem[i].done = p.getULong(k, 0);
+    }
+    p.end();
+}
+
+static void rem_save(int i)
+{
+    Preferences p;
+    p.begin("globebus", false);
+    char k[8];
+    snprintf(k, sizeof(k), "rem%dd", i);
+    p.putUShort(k, g_rem[i].days);
+    snprintf(k, sizeof(k), "rem%dt", i);
+    p.putULong(k, g_rem[i].done);
+    p.end();
+}
+
+static long rem_days_left(const Reminder &r)       // <= 0: due (0 today, -n overdue by n days)
+{
+    long left = (long)r.done + (long)r.days * 86400L - (long)time(nullptr);
+    return left > 0 ? (left + 86399) / 86400 : -((-left) / 86400);
+}
+
+static void rem_due_text(char *b, size_t n, long d)
+{
+    if (d > 1)        snprintf(b, n, "in %ld d", d);
+    else if (d == 1)  snprintf(b, n, "tomorrow");
+    else if (d == 0)  snprintf(b, n, "due today");
+    else              snprintf(b, n, "overdue %ld d", -d);
+}
+
+static void rem_tick()                           // caller holds the LVGL lock
+{
+    if (!time_valid()) return;
+    g_rem_due = -1;
+    for (int i = 0; i < REM_N; i++) {
+        Reminder &r = g_rem[i];
+        if (!r.done) {                           // first valid clock: start the countdown
+            r.done = (uint32_t)time(nullptr);
+            rem_save(i);
+        }
+        long d = rem_days_left(r);
+        char b[32];
+        if (r.lbl_iv) {
+            snprintf(b, sizeof(b), "every %u d", r.days);
+            lv_label_set_text(r.lbl_iv, b);
+        }
+        if (r.lbl_due) {
+            rem_due_text(b, sizeof(b), d);
+            lv_label_set_text(r.lbl_due, b);
+            lv_obj_set_style_text_color(r.lbl_due, d <= 0 ? lv_color_hex(0xF0C565) : COL_MUTED, 0);
+        }
+        if (d <= 0 && g_rem_due < 0) g_rem_due = i;
+    }
+    if (!rem_strip) return;
+    if (g_rem_due < 0) {
+        lv_obj_add_flag(rem_strip, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    char due[24], b[96];
+    rem_due_text(due, sizeof(due), rem_days_left(g_rem[g_rem_due]));
+    snprintf(b, sizeof(b), "%s \xC2\xB7 %s", g_rem[g_rem_due].name, due);
+    lv_label_set_text(rem_strip_lbl, b);
+    lv_obj_clear_flag(rem_strip, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void rem_done_cb(lv_event_t *e)
+{
+    intptr_t i = (intptr_t)lv_event_get_user_data(e);
+    if (i < 0) i = g_rem_due;                     // the clock page's button: whichever is shown
+    if (i < 0 || i >= REM_N) return;
+    g_rem[i].done = (uint32_t)time(nullptr);
+    rem_save((int)i);
+    vlog("REMINDER done: %s (every %u d)", g_rem[i].name, g_rem[i].days);
+    rem_tick();
+}
+
+static void rem_step_cb(lv_event_t *e)
+{
+    intptr_t v = (intptr_t)lv_event_get_user_data(e);  // index*2 + (0 = minus, 1 = plus)
+    int i = (int)(v / 2);
+    int d = g_rem[i].days + ((v & 1) ? 5 : -5);
+    g_rem[i].days = (uint16_t)LV_CLAMP(5, d, 365);
+    rem_save(i);
+    rem_tick();
+}
+
+static void build_reminders_tab(lv_obj_t *t)
+{
+    for (int i = 0; i < REM_N; i++) {
+        int y = i * 64;
+        lv_obj_t *n = make_label(t, &lv_font_montserrat_22, COL_TEXT);
+        lv_label_set_text(n, g_rem[i].name);
+        lv_obj_set_pos(n, 0, y + 8);
+        lv_obj_t *m = make_button(t, "-", 44, 40, rem_step_cb, (void *)(intptr_t)(i * 2));
+        lv_obj_set_pos(m, 200, y);
+        g_rem[i].lbl_iv = make_label(t, &lv_font_montserrat_20, COL_MUTED);
+        lv_obj_set_width(g_rem[i].lbl_iv, 130);
+        lv_obj_set_style_text_align(g_rem[i].lbl_iv, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_pos(g_rem[i].lbl_iv, 250, y + 9);
+        lv_obj_t *pl = make_button(t, "+", 44, 40, rem_step_cb, (void *)(intptr_t)(i * 2 + 1));
+        lv_obj_set_pos(pl, 386, y);
+        g_rem[i].lbl_due = make_label(t, &lv_font_montserrat_20, COL_MUTED);
+        lv_obj_set_pos(g_rem[i].lbl_due, 450, y + 9);
+        lv_obj_t *d = make_button(t, "Done", 110, 40, rem_done_cb, (void *)(intptr_t)i);
+        lv_obj_set_pos(d, 632, y);
+    }
+    lv_obj_t *note = make_label(t, &lv_font_montserrat_16, COL_DIM);
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(note, 740);
+    lv_label_set_text(note, "Change the interval with - / + (5 days a step). Done restarts the countdown. A due reminder "
+                            "also shows on the clock page.");
+    lv_obj_set_pos(note, 0, 210);
+    rem_tick();
+}
+
 static void build_clock_page(lv_obj_t *p)
 {
     lbl_big_clock = make_label(p, &font_clock_170, COL_TEXT);
@@ -2223,6 +2510,21 @@ static void build_clock_page(lv_obj_t *p)
     lbl_big_date = make_label(p, &lv_font_montserrat_36, COL_MUTED);
     lv_label_set_text(lbl_big_date, "");
     lv_obj_align(lbl_big_date, LV_ALIGN_CENTER, 0, 90);
+
+    rem_strip = lv_obj_create(p);
+    lv_obj_remove_style_all(rem_strip);
+    lv_obj_set_pos(rem_strip, 150, 350);
+    lv_obj_set_size(rem_strip, 500, 54);
+    lv_obj_set_style_radius(rem_strip, 12, 0);
+    lv_obj_set_style_bg_color(rem_strip, COL_BTN, 0);
+    lv_obj_set_style_bg_opa(rem_strip, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(rem_strip, LV_OBJ_FLAG_SCROLLABLE);
+    rem_strip_lbl = make_label(rem_strip, &font_text_18, lv_color_hex(0xF0C565));
+    lv_label_set_text(rem_strip_lbl, "");
+    lv_obj_align(rem_strip_lbl, LV_ALIGN_LEFT_MID, 22, 0);
+    lv_obj_t *done = make_button(rem_strip, "Done", 96, 34, rem_done_cb, (void *)(intptr_t)-1);
+    lv_obj_align(done, LV_ALIGN_RIGHT_MID, -10, 0);
+    lv_obj_add_flag(rem_strip, LV_OBJ_FLAG_HIDDEN);
 
     page_dots(p, 3);
 }
@@ -2328,59 +2630,50 @@ static void build_weather_tab(lv_obj_t *t)
     lv_obj_set_pos(n, 0, 200);
 }
 
-static void build_display_tab(lv_obj_t *t)
+static void night_dd_cb(lv_event_t *e)
+{
+    g_night_idx = lv_dropdown_get_selected(dd_night);
+    Preferences p;
+    p.begin("globebus", false);
+    p.putUChar("night", (uint8_t)g_night_idx);
+    p.end();
+    vlog("SETTING night mode %s", g_night_idx == 0 ? "off" : (g_night_idx == 1 ? "auto" : "always"));
+    night_apply(night_wanted());                  // LVGL event: lock already held
+}
+
+static lv_obj_t *display_row(lv_obj_t *t, const char *text, int y, const char *opts, int sel, lv_event_cb_t cb)
 {
     lv_obj_t *l = make_label(t, &lv_font_montserrat_22, COL_TEXT);
-    lv_label_set_text(l, "Screen off after");
-    lv_obj_set_pos(l, 0, 10);
-    dd_timeout = lv_dropdown_create(t);
-    lv_dropdown_set_options_static(dd_timeout, TIMEOUT_OPTS);
-    lv_dropdown_set_selected(dd_timeout, g_timeout_idx);
-    lv_obj_set_width(dd_timeout, 200);
-    lv_obj_set_style_text_font(dd_timeout, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(dd_timeout), &lv_font_montserrat_22, 0);
-    lv_obj_set_pos(dd_timeout, 330, 0);
-    lv_obj_add_event_cb(dd_timeout, timeout_dd_cb, LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_t *l2 = make_label(t, &lv_font_montserrat_22, COL_TEXT);
-    lv_label_set_text(l2, "Keep reading");
-    lv_obj_set_pos(l2, 0, 74);
-    dd_hold = lv_dropdown_create(t);
-    lv_dropdown_set_options_static(dd_hold, HOLD_OPTS);
-    lv_dropdown_set_selected(dd_hold, g_hold_idx);
-    lv_obj_set_width(dd_hold, 200);
-    lv_obj_set_style_text_font(dd_hold, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(dd_hold), &lv_font_montserrat_22, 0);
-    lv_obj_set_pos(dd_hold, 330, 64);
-    lv_obj_add_event_cb(dd_hold, hold_dd_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_label_set_text(l, text);
+    lv_obj_set_pos(l, 0, y + 10);
+    lv_obj_t *dd = lv_dropdown_create(t);
+    lv_dropdown_set_options_static(dd, opts);
+    lv_dropdown_set_selected(dd, sel);
+    lv_obj_set_width(dd, 260);
+    lv_obj_set_style_text_font(dd, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_font(lv_dropdown_get_list(dd), &lv_font_montserrat_22, 0);
+    lv_obj_set_pos(dd, 250, y);
+    lv_obj_add_event_cb(dd, cb, LV_EVENT_VALUE_CHANGED, nullptr);
+    return dd;
+}
+
+static void build_display_tab(lv_obj_t *t)
+{
+    dd_timeout = display_row(t, "Screen off after", 0, TIMEOUT_OPTS, g_timeout_idx, timeout_dd_cb);
+    dd_hold    = display_row(t, "Keep reading", 56, HOLD_OPTS, g_hold_idx, hold_dd_cb);
+    dd_theme   = display_row(t, "Theme", 112, THEME_OPTS, g_theme_idx, theme_dd_cb);
+    dd_night   = display_row(t, "Night mode", 168, NIGHT_OPTS, g_night_idx, night_dd_cb);
+    lv_obj_t *bt = make_button(t, "Backlight test (5 s off)", 230, 46, bl_test_cb, nullptr);
+    lv_obj_set_pos(bt, 530, 0);
+    lv_obj_set_style_text_font(lv_obj_get_child(bt, 0), &lv_font_montserrat_16, 0);
 
     lv_obj_t *n = make_label(t, &lv_font_montserrat_16, COL_DIM);
     lv_label_set_long_mode(n, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(n, 740);
-    lv_label_set_text(n, "With no touch and no Toptron press for this long, the screen goes black and the backlight "
-                         "switches off (saves power and prevents image retention). Touch anywhere or press a "
-                         "selector to wake - the waking touch does not press any button.");
-    lv_obj_set_pos(n, 0, 134);
-    lv_obj_t *bt = make_button(t, "Backlight test (5 s off)", 320, 46, bl_test_cb, nullptr);
-    lv_obj_set_pos(bt, 420, 128);
-
-    lv_obj_t *n2 = make_label(t, &lv_font_montserrat_16, COL_DIM);
-    lv_label_set_long_mode(n2, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(n2, 740);
-    lv_label_set_text(n2, "\"Keep reading\" is how long the last measured value stays on the gauge page after you let "
-                          "go of the selector. Until release matches the old gauge, whose needle fell back.");
-    lv_obj_set_pos(n2, 0, 210);
-
-    lv_obj_t *l3 = make_label(t, &lv_font_montserrat_22, COL_TEXT);
-    lv_label_set_text(l3, "Theme");
-    lv_obj_set_pos(l3, 0, 280);
-    dd_theme = lv_dropdown_create(t);
-    lv_dropdown_set_options_static(dd_theme, THEME_OPTS);
-    lv_dropdown_set_selected(dd_theme, g_theme_idx);
-    lv_obj_set_width(dd_theme, 260);
-    lv_obj_set_style_text_font(dd_theme, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_font(lv_dropdown_get_list(dd_theme), &lv_font_montserrat_22, 0);
-    lv_obj_set_pos(dd_theme, 330, 270);
-    lv_obj_add_event_cb(dd_theme, theme_dd_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_label_set_text(n, "Screen off: black screen + backlight off after this long without touch or press; touch or a "
+                         "selector wakes it. Keep reading: how long a value stays after you let go. Night mode: dim red "
+                         "colours, Auto from sunset to sunrise (forecast; 20:00-07:00 without one).");
+    lv_obj_set_pos(n, 0, 230);
 }
 
 static void build_diag_tab(lv_obj_t *t)
@@ -2439,9 +2732,9 @@ static void build_settings_screen()
     lv_obj_t *content = lv_tabview_get_content(tv);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);   // tabs by tapping only, no accidental swipes
 
-    lv_obj_t *tabs[6];
-    const char *names[6] = {"Clock", "Wi-Fi", "BT", "Weather", "Display", "Diag"};
-    for (int i = 0; i < 6; i++) {
+    lv_obj_t *tabs[7];
+    const char *names[7] = {"Clock", "Wi-Fi", "BT", "Weather", "Display", "Remind", "Diag"};
+    for (int i = 0; i < 7; i++) {
         tabs[i] = lv_tabview_add_tab(tv, names[i]);
         lv_obj_set_style_pad_all(tabs[i], 24, 0);
     }
@@ -2450,7 +2743,8 @@ static void build_settings_screen()
     build_ble_tab(tabs[2]);
     build_weather_tab(tabs[3]);
     build_display_tab(tabs[4]);
-    build_diag_tab(tabs[5]);
+    build_reminders_tab(tabs[5]);
+    build_diag_tab(tabs[6]);
 }
 
 // ---------- network state -> UI ---------------------------------------------
@@ -2542,6 +2836,126 @@ static void update_rtc_status()
 }
 
 // ---------- Arduino entry points ---------------------------------------------
+
+// ---------- phone page --------------------------------------------------------------
+// Read-only page on the van Wi-Fi: http://globebus.local (mDNS) or the board's IP (shown in Settings > Diag). No
+// password: anyone on the same Wi-Fi can look, nobody can change anything (user decision 2026-10-23).
+static WebServer g_web(80);
+
+static const char WEB_PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Globebus</title><style>
+body{margin:0;background:#141A20;color:#E8EDF1;font-family:sans-serif}h1{font-size:22px;font-weight:500;margin:16px}
+#t{float:right;color:#8FA1AD;font-size:16px;margin-top:4px}.row{display:flex;justify-content:space-around;margin:8px 0}
+.v{font-size:26px;text-align:center}.s{font-size:13px;color:#8FA1AD;text-align:center}
+.card{margin:12px;background:#1C242C;border-radius:12px;padding:8px}.m{margin:12px;font-size:16px}
+.n{margin:12px;font-size:13px;color:#8FA1AD}.b{margin:0 12px 8px;padding:8px 12px;border-radius:14px;font-size:15px}
+</style></head><body><h1>Globebus<span id="t"></span></h1><div id="ban"></div>
+<div class="row"><div><svg id="bb" width="120" height="160"></svg><div class="v" id="bv">--</div><div class="s" id="bs"></div></div>
+<div><svg id="wb" width="120" height="160"></svg><div class="v" id="wv">--</div><div class="s" id="ws"></div></div></div>
+<div class="card"><div class="s" style="text-align:left">Leisure battery &middot; 24 h</div>
+<svg id="hg" viewBox="0 0 300 100" width="100%" height="110" preserveAspectRatio="none"></svg></div>
+<div class="m" id="wx"></div><div class="n">Read-only. Refreshes every 30 s.</div><script>
+function box(id,f,c,st){var h=Math.round(152*Math.max(0,Math.min(1,f))),y=156-h,s='<defs><clipPath id="c'+id+'"><rect x="4" y="4" width="112" height="152" rx="10"/></clipPath><pattern id="p'+id+'" width="10" height="10" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="10" height="10" fill="#2C5AA6"/><rect width="4" height="10" fill="#3D78D8"/></pattern></defs>';
+if(h>0)s+='<rect clip-path="url(#c'+id+')" x="4" y="'+y+'" width="112" height="'+h+'" fill="'+(st?'url(#p'+id+')':c)+'"/>';
+s+='<rect x="4" y="4" width="112" height="152" rx="10" fill="none" stroke="#fff" stroke-width="4"/>';document.getElementById(id).innerHTML=s}
+function $(i){return document.getElementById(i)}
+function upd(d){$('t').textContent=d.time||'';
+if(d.live){box('bb',d.live.fill,d.live.color,false);$('bv').textContent=d.live.v.toFixed(1)+' V';$('bs').textContent=d.live.charging?'leisure, live, charging':'leisure, live'}
+else{box('bb',0,'',false);$('bv').textContent='-- V';$('bs').textContent='no van feed'}
+if(d.last){box('wb',d.last.tfill,'#3D78D8',d.last.low);$('wv').textContent=d.last.tank;$('ws').textContent='last reading '+d.last.at}
+else{box('wb',0,'',false);$('wv').textContent='-- %';$('ws').textContent='no reading yet'}
+$('ban').innerHTML=d.banner?'<div class="b" style="background:'+d.banner.bg+';color:'+d.banner.fg+'">'+d.banner.text+'</div>':'';
+var p='',x;for(var i=0;i<d.hist.length;i++){if(d.hist[i]==null)continue;x=i*300/(d.hist.length-1);p+=(p?' L':'M')+x.toFixed(1)+' '+(100-(d.hist[i]-1180)*100/240).toFixed(1)}
+$('hg').innerHTML=p?'<path d="'+p+'" fill="none" stroke="#E8EDF1" stroke-width="2"/>':'<text x="150" y="55" fill="#8FA1AD" font-size="11" text-anchor="middle">no history yet</text>';
+$('wx').textContent=d.wx?(d.wx.t+'° '+d.wx.cond+' · tonight '+d.wx.tonight+'°'):''}
+function go(){fetch('/api').then(function(r){return r.json()}).then(upd).catch(function(){})}go();setInterval(go,30000);
+</script></body></html>)HTML";
+
+static void web_api()
+{
+    String j;
+    j.reserve(2400);
+    char b[200];
+    char hm[8] = "";
+    if (time_valid()) {
+        time_t now = time(nullptr);
+        struct tm t;
+        localtime_r(&now, &t);
+        snprintf(hm, sizeof(hm), "%02d:%02d", t.tm_hour, t.tm_min);
+    }
+    snprintf(b, sizeof(b), "{\"time\":\"%s\",", hm);
+    j += b;
+    float v = live_battery_v();
+    if (!isnan(v)) {
+        float f = battery_fill(v);
+        snprintf(b, sizeof(b), "\"live\":{\"v\":%.2f,\"fill\":%.2f,\"color\":\"%s\",\"charging\":%s},", v, f,
+                 f < 0.25f ? "#E5483D" : (f < 0.5f ? "#E0B030" : "#639922"), v >= CHARGING_V ? "true" : "false");
+    } else {
+        snprintf(b, sizeof(b), "\"live\":null,");
+    }
+    j += b;
+    if (g_last_at) {
+        struct tm t;
+        localtime_r(&g_last_at, &t);
+        snprintf(b, sizeof(b), "\"last\":{\"v\":%.2f,\"tank\":\"%s\",\"tfill\":%.2f,\"low\":%s,\"at\":\"%02d:%02d\"},",
+                 g_last_v, g_last_tank, g_last_tfill, g_last_low ? "true" : "false", t.tm_hour, t.tm_min);
+    } else {
+        snprintf(b, sizeof(b), "\"last\":null,");
+    }
+    j += b;
+    if (g_low_bat && !isnan(v))
+        snprintf(b, sizeof(b), "\"banner\":{\"text\":\"Leisure battery low \\u00b7 %.1f V \\u00b7 recharge soon\","
+                               "\"bg\":\"#5C1A16\",\"fg\":\"#FFC9C3\"},", v);
+    else if (g_frost)
+        snprintf(b, sizeof(b), "\"banner\":{\"text\":\"%s\",\"bg\":\"#123A5C\",\"fg\":\"#CFE8FF\"},", g_frost_text);
+    else
+        snprintf(b, sizeof(b), "\"banner\":null,");
+    j += b;
+    j += "\"hist\":[";                             // last 24 h in 15-minute buckets, volts x 100
+    if (!g_hist_tmp) g_hist_tmp = (HistPoint *)heap_caps_malloc(HIST_CAP * sizeof(HistPoint), MALLOC_CAP_SPIRAM);
+    int n = 0;
+    time_t now = time(nullptr), from = now - 96 * 900;
+    if (time_valid() && g_hist_tmp) n = hist_window(from, now, g_hist_tmp, HIST_CAP);
+    for (int k = 0; k < 96; k++) {
+        int32_t sum = 0, cnt = 0;
+        for (int i = 0; i < n; i++) {
+            int bk = (int)(((time_t)g_hist_tmp[i].t - from) / 900);
+            if (bk == k) {
+                sum += g_hist_tmp[i].cv;
+                cnt++;
+            }
+        }
+        if (cnt) snprintf(b, sizeof(b), "%s%ld", k ? "," : "", (long)(sum / cnt));
+        else     snprintf(b, sizeof(b), "%snull", k ? "," : "");
+        j += b;
+    }
+    j += "],";
+    if (g_ns.wx_valid) {
+        time_t now2 = time(nullptr);
+        struct tm t;
+        localtime_r(&now2, &t);
+        snprintf(b, sizeof(b), "\"wx\":{\"t\":%.0f,\"cond\":\"%s\",\"tonight\":%.0f}}", g_ns.temp, wx_text(g_ns.code),
+                 g_ns.day[t.tm_hour < 6 ? 0 : 1].tmin);
+    } else {
+        snprintf(b, sizeof(b), "\"wx\":null}");
+    }
+    j += b;
+    g_web.send(200, "application/json", j);
+}
+
+static void web_poll()                           // loop(), at rest
+{
+    if (!g_web_on) {
+        if (!g_ns.connected) return;
+        g_web.on("/", HTTP_GET, []() { g_web.send_P(200, "text/html", WEB_PAGE); });
+        g_web.on("/api", HTTP_GET, web_api);
+        g_web.begin();
+        if (MDNS.begin("globebus")) MDNS.addService("http", "tcp", 80);
+        g_web_on = true;
+        vlog("WEB phone page on http://globebus.local / http://%s", WiFi.localIP().toString().c_str());
+    }
+    g_web.handleClient();
+}
 
 // ---------- persistent log: boot record, periodic sample, USB commands --------------------------------------
 
@@ -2701,6 +3115,7 @@ void setup()
     system_time_from_rtc();
     vlog_begin();
     hist_begin();
+    rem_load();
     log_boot();
 
     {
@@ -2710,6 +3125,8 @@ void setup()
         int hidx = p.getUChar("hold", HOLD_DEFAULT);
         int tidx = p.getUChar("theme", 0);
         g_theme_idx = (tidx == 1) ? 1 : 0;
+        int nidx = p.getUChar("night", 1);
+        g_night_idx = (nidx >= 0 && nidx <= 2) ? nidx : 1;
         p.end();
         g_hold_idx = (hidx >= 0 && hidx < (int)(sizeof(HOLD_SECONDS) / sizeof(HOLD_SECONDS[0]))) ? hidx : HOLD_DEFAULT;
         g_timeout_idx = (idx >= 0 && idx < (int)(sizeof(TIMEOUT_MIN) / sizeof(TIMEOUT_MIN[0]))) ? idx : TIMEOUT_DEFAULT;
@@ -2780,6 +3197,38 @@ void loop()
         static uint32_t last_live_ms = 0;            // Duo idle: live leisure battery every 2 s
         if (millis() - last_live_ms >= 2000) {
             last_live_ms = millis();
+            static uint32_t low_since = 0;           // low-battery banner: red band for 2 min, clears in green
+            float lv = live_battery_v();
+            const float v25 = BAT_EMPTY_V + 0.25f * (BAT_FULL_V - BAT_EMPTY_V);
+            const float v50 = BAT_EMPTY_V + 0.50f * (BAT_FULL_V - BAT_EMPTY_V);
+            bool was_low = g_low_bat;
+            if (isnan(lv)) {
+                low_since = 0;
+                g_low_bat = false;
+            } else if (lv < v25) {
+                if (!low_since) low_since = millis();
+                if (millis() - low_since >= 120000UL) g_low_bat = true;
+            } else {
+                low_since = 0;
+                if (lv >= v50) g_low_bat = false;
+            }
+            lvgl_port_lock(-1);
+            if (g_low_bat) {
+                static int last_dv = -1;
+                int dv = (int)lroundf(lv * 10);
+                if (dv != last_dv) {
+                    char b[80];
+                    snprintf(b, sizeof(b), "Leisure battery low \xC2\xB7 %.1f V \xC2\xB7 recharge soon", lv);
+                    lv_label_set_text(lbl_low, b);
+                    lv_obj_center(lbl_low);
+                    last_dv = dv;
+                }
+            }
+            if (was_low != g_low_bat) {
+                vlog("LOW battery banner %s (live %.2f V)", g_low_bat ? "on" : "off", lv);
+                update_banners();
+            }
+            lvgl_port_unlock();
             if (!g_display_ms && !g_screen_off && g_theme_idx == 1) {
                 lvgl_port_lock(-1);
                 duo_show_live();
@@ -2799,6 +3248,7 @@ void loop()
             }
         }
         hist_save_if_due();
+        web_poll();
         static uint32_t last_supply_ms = 0;
         if (millis() - last_supply_ms >= 1000) {
             last_supply_ms = millis();
