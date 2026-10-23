@@ -279,7 +279,7 @@ static bool fetch_weather()
              "http://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f"
              "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m,"
              "wind_direction_10m,is_day"
-             "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+             "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset"
              "&timezone=auto&forecast_days=%d",
              lat, lon, WX_DAYS);
     JsonDocument doc;
@@ -306,6 +306,11 @@ static bool fetch_weather()
         d.tmax = dly["temperature_2m_max"][i] | NAN;
         d.tmin = dly["temperature_2m_min"][i] | NAN;
         d.pop  = dly["precipitation_probability_max"][i] | -1;
+        int hh = 0, mm = 0;                     // "2026-10-23T07:42", local time (timezone=auto)
+        const char *sr = dly["sunrise"][i] | "";
+        const char *ss = dly["sunset"][i] | "";
+        d.sunrise_min = (strlen(sr) >= 16 && sscanf(sr + 11, "%d:%d", &hh, &mm) == 2) ? hh * 60 + mm : -1;
+        d.sunset_min  = (strlen(ss) >= 16 && sscanf(ss + 11, "%d:%d", &hh, &mm) == 2) ? hh * 60 + mm : -1;
         const char *date = dly["time"][i] | "";
         int y = 0, m = 0, dd = 0;
         if (i == 0) strlcpy(d.label, "Today", sizeof(d.label));

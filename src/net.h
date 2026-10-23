@@ -20,6 +20,8 @@ struct WxDay {
     int   code;         // WMO weather code
     float tmax, tmin;   // deg C
     int   pop;          // max precipitation probability, %
+    short sunrise_min;  // local minutes after midnight, -1 = unknown
+    short sunset_min;
     char  label[8];     // "Today", "Mon", ...
 };
 
